@@ -1,790 +1,1853 @@
-# modules/revenue_leakage_detector.py
+"""
+AI-driven Revenue Leakage Detection and Forecasting System
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import plotly.express as px
-import plotly.graph_objects as go
-from sklearn.ensemble import RandomForestRegressor, IsolationForest, GradientBoostingRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from datetime import datetime, timedelta
+This module provides a production-ready implementation for detecting and forecasting
+revenue leakages across multiple dimensions including discounting, profitability,
+product performance, and regional trends.
+
+Architecture:
+    - RevenueLeakageAnalyzer: Core analytics and ML logic
+    - LLMInsightGenerator: LLM-based narrative insights
+    - Streamlit UI functions: User interface layer
+
+Author: IFB Decision Intelligence Hub
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Any, Callable
 import warnings
 warnings.filterwarnings('ignore')
 
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from sklearn.ensemble import (
+    GradientBoostingRegressor,
+    GradientBoostingClassifier,
+    RandomForestRegressor,
+    RandomForestClassifier,
+    IsolationForest
+)
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import LabelEncoder
 
-class RevenueLeakageDetector:
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+@dataclass
+class RevenueLeakageConfig:
+    """Configuration for revenue leakage analysis."""
+
+    # Target margins
+    target_margin: float = 0.15  # 15% default target margin
+    category_margins: Dict[str, float] = field(default_factory=dict)
+
+    # Thresholds
+    high_discount_threshold: float = 0.20  # 20%
+    low_margin_threshold: float = 0.05  # 5%
+    anomaly_percentile: float = 0.95  # 95th percentile for anomalies
+
+    # Forecasting
+    forecast_horizon: int = 6  # months
+    train_test_split: float = 0.75
+
+    # Model parameters
+    n_estimators: int = 100
+    random_state: int = 42
+
+    # Feature engineering
+    lag_periods: List[int] = field(default_factory=lambda: [1, 3])
+    rolling_windows: List[int] = field(default_factory=lambda: [3, 6])
+
+    # Required columns
+    required_columns: List[str] = field(default_factory=lambda: ['Sales', 'Profit'])
+    optional_columns: List[str] = field(default_factory=lambda: [
+        'Discount', 'Category', 'Sub Category', 'Region',
+        'State', 'Customer Segment', 'Order Date', 'Order_Date'
+    ])
+
+
+# ============================================================================
+# Core Analytics Engine
+# ============================================================================
+
+class RevenueLeakageAnalyzer:
     """
-    AI-driven Revenue Leakage Detection and Forecasting System
+    Core analytics engine for revenue leakage detection and forecasting.
 
-    This class identifies various types of revenue leakages including:
-    - Excessive discounting patterns
-    - Profit margin erosion
-    - Underperforming products/categories
-    - Regional performance issues
-    - Customer profitability problems
-    - Pricing inefficiencies
+    This class contains all business logic for:
+    - Data preparation and validation
+    - Feature engineering
+    - Leakage metrics computation
+    - Time-series forecasting
+    - Anomaly detection
+    - Risk scoring
+
+    No Streamlit UI code is included in this class.
     """
 
-    def __init__(self, data, llm):
-        self.data = data.copy()
-        self.llm = llm
-        self.leakage_report = {}
-        self.prepare_data()
+    def __init__(self, df: pd.DataFrame, config: Optional[RevenueLeakageConfig] = None):
+        """
+        Initialize the analyzer with data and configuration.
 
-    def prepare_data(self):
-        """Prepare and clean the dataset for analysis"""
-        # Convert date columns to datetime
-        date_columns = self.data.select_dtypes(include=['object']).columns
-        for col in date_columns:
+        Args:
+            df: Input DataFrame containing sales/transaction data
+            config: Configuration object (uses defaults if None)
+
+        Raises:
+            ValueError: If required columns are missing
+        """
+        self.df = df.copy()
+        self.config = config or RevenueLeakageConfig()
+        self.date_column: Optional[str] = None
+        self.prepared = False
+
+        # Validate schema
+        self._validate_schema()
+
+    def _validate_schema(self) -> None:
+        """
+        Validate that required columns exist in the dataset.
+
+        Raises:
+            ValueError: If required columns are missing
+        """
+        missing_cols = [col for col in self.config.required_columns
+                       if col not in self.df.columns]
+
+        if missing_cols:
+            raise ValueError(
+                f"Missing required columns: {missing_cols}. "
+                f"Available columns: {list(self.df.columns)}"
+            )
+
+    def prepare_data(self) -> pd.DataFrame:
+        """
+        Prepare and clean the dataset with comprehensive feature engineering.
+
+        This method:
+        - Validates and converts data types
+        - Normalizes discount values
+        - Computes leakage metrics
+        - Creates time-based features
+        - Adds lag and rolling features
+
+        Returns:
+            Prepared DataFrame with all engineered features
+        """
+        if self.prepared:
+            return self.df
+
+        # Convert numeric fields
+        numeric_fields = ['Sales', 'Profit', 'Discount', 'Quantity']
+        for field in numeric_fields:
+            if field in self.df.columns:
+                self.df[field] = pd.to_numeric(self.df[field], errors='coerce')
+
+        # Detect and convert date columns
+        self._detect_and_convert_dates()
+
+        # Normalize discount logic
+        if 'Discount' in self.df.columns:
+            self._normalize_discounts()
+
+        # Add leakage metrics
+        self._compute_leakage_metrics()
+
+        # Add time-based features if date column exists
+        if self.date_column:
+            self._add_time_features()
+
+        self.prepared = True
+        return self.df
+
+    def _detect_and_convert_dates(self) -> None:
+        """Detect and convert date columns to datetime."""
+        for col in self.df.columns:
+            # Check if already datetime
+            if pd.api.types.is_datetime64_any_dtype(self.df[col]):
+                if self.date_column is None:
+                    self.date_column = col
+                continue
+
+            # Check if column name suggests it's a date
             if 'date' in col.lower():
                 try:
-                    self.data[col] = pd.to_datetime(self.data[col], format='%d-%m-%Y', errors='coerce')
-                except:
-                    try:
-                        self.data[col] = pd.to_datetime(self.data[col], errors='coerce')
-                    except:
-                        pass
+                    self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
+                    if self.date_column is None:
+                        self.date_column = col
+                except Exception:
+                    pass
 
-        # Calculate additional metrics if not present
-        if 'Sales' in self.data.columns and 'Profit' in self.data.columns:
-            self.data['Profit_Margin'] = (self.data['Profit'] / self.data['Sales'] * 100).round(2)
-            self.data['Revenue_Lost_to_Discount'] = (self.data['Sales'] * self.data.get('Discount', 0))
-            self.data['Potential_Revenue'] = self.data['Sales'] / (1 - self.data.get('Discount', 0))
+    def _normalize_discounts(self) -> None:
+        """
+        Normalize discount values to fractions and handle edge cases.
 
-    def detect_leakages(self):
-        """Main method to detect all types of revenue leakages"""
-        st.header("🔍 AI-Powered Revenue Leakage Analysis")
-        st.markdown("""
-        This comprehensive analysis identifies revenue leakages across multiple dimensions:
-        discounting, profitability, product performance, regional trends, and more.
-        """)
+        Detects if discounts are in percentage format (>1) and converts to fractions.
+        Clips values to reasonable range [0, 0.9].
+        """
+        # Check if values look like percentages
+        if self.df['Discount'].abs().max() > 1.0:
+            self.df['Discount'] = self.df['Discount'] / 100.0
 
-        # Create tabs for different analyses
-        tabs = st.tabs([
-            "📊 Executive Summary",
-            "💰 Discount Analysis",
-            "📉 Profit Erosion",
-            "📦 Product Performance",
-            "🌍 Regional Analysis",
-            "🔮 Forecasting",
-            "📈 Anomaly Detection",
-            "📋 Recommendations"
-        ])
+        # Clip to reasonable range
+        self.df['Discount'] = self.df['Discount'].clip(0, 0.9)
 
-        with tabs[0]:
-            self.executive_summary()
+        # Handle negative or extreme values
+        self.df.loc[self.df['Discount'] < 0, 'Discount'] = 0
+        self.df.loc[self.df['Discount'] > 0.9, 'Discount'] = 0.9
 
-        with tabs[1]:
-            self.analyze_discount_leakage()
+    def _compute_leakage_metrics(self) -> None:
+        """
+        Compute comprehensive leakage metrics.
 
-        with tabs[2]:
-            self.analyze_profit_erosion()
+        Creates:
+        - Profit_Margin: Actual profit margin percentage
+        - Expected_Profit: Expected profit based on target margin
+        - Margin_Leakage: Shortfall from expected profit
+        - Discount_Leakage: Revenue lost to discounts
+        - Total_Leakage: Combined leakage
+        - Leakage_Rate: Leakage as percentage of sales
+        """
+        # Profit margin (with safe division)
+        self.df['Profit_Margin'] = np.where(
+            self.df['Sales'] > 0,
+            (self.df['Profit'] / self.df['Sales']) * 100,
+            0
+        )
 
-        with tabs[3]:
-            self.analyze_product_performance()
+        # Expected profit based on target margin
+        if 'Category' in self.df.columns and self.config.category_margins:
+            # Use category-specific margins if available
+            self.df['Target_Margin'] = self.df['Category'].map(
+                self.config.category_margins
+            ).fillna(self.config.target_margin)
+        else:
+            self.df['Target_Margin'] = self.config.target_margin
 
-        with tabs[4]:
-            self.analyze_regional_performance()
+        self.df['Expected_Profit'] = self.df['Sales'] * self.df['Target_Margin']
 
-        with tabs[5]:
-            self.forecast_revenue_leakage()
+        # Margin leakage (only positive - shortfall from expected)
+        self.df['Margin_Leakage'] = np.maximum(
+            self.df['Expected_Profit'] - self.df['Profit'],
+            0
+        )
 
-        with tabs[6]:
-            self.detect_anomalies()
+        # Discount leakage
+        if 'Discount' in self.df.columns:
+            self.df['Discount_Leakage'] = self.df['Sales'] * self.df['Discount']
+        else:
+            self.df['Discount_Leakage'] = 0
 
-        with tabs[7]:
-            self.generate_recommendations()
+        # Total leakage
+        self.df['Total_Leakage'] = (
+            self.df['Margin_Leakage'] + self.df['Discount_Leakage']
+        )
 
-    def executive_summary(self):
-        """Generate executive summary of revenue leakages"""
-        st.subheader("📊 Executive Summary - Revenue Leakage Overview")
+        # Leakage rate (with safe division)
+        self.df['Leakage_Rate'] = np.where(
+            self.df['Sales'] > 0,
+            (self.df['Total_Leakage'] / self.df['Sales']) * 100,
+            0
+        )
 
-        # Calculate key metrics
-        total_sales = self.data['Sales'].sum() if 'Sales' in self.data.columns else 0
-        total_profit = self.data['Profit'].sum() if 'Profit' in self.data.columns else 0
-        avg_discount = self.data['Discount'].mean() * 100 if 'Discount' in self.data.columns else 0
-        avg_profit_margin = (total_profit / total_sales * 100) if total_sales > 0 else 0
+    def _add_time_features(self) -> None:
+        """Add time-based features for temporal analysis."""
+        if not self.date_column or self.date_column not in self.df.columns:
+            return
 
-        # Revenue lost to discounts
-        revenue_lost_discount = self.data['Revenue_Lost_to_Discount'].sum() if 'Revenue_Lost_to_Discount' in self.data.columns else 0
+        date_col = self.df[self.date_column]
 
-        # Negative profit transactions
-        negative_profit_count = len(self.data[self.data['Profit'] < 0]) if 'Profit' in self.data.columns else 0
-        negative_profit_amount = self.data[self.data['Profit'] < 0]['Profit'].sum() if 'Profit' in self.data.columns else 0
+        # Basic time features
+        self.df['Year'] = date_col.dt.year
+        self.df['Month'] = date_col.dt.month
+        self.df['Quarter'] = date_col.dt.quarter
+        self.df['YearMonth'] = date_col.dt.to_period('M')
+        self.df['DayOfWeek'] = date_col.dt.dayofweek
 
-        # Display key metrics
-        col1, col2, col3, col4 = st.columns(4)
+    def compute_leakage_metrics(self) -> Dict[str, float]:
+        """
+        Compute overall leakage metrics summary.
 
-        with col1:
-            st.metric("Total Sales", f"${total_sales:,.2f}")
-            st.metric("Total Profit", f"${total_profit:,.2f}")
+        Returns:
+            Dictionary containing key leakage metrics
+        """
+        if not self.prepared:
+            self.prepare_data()
 
-        with col2:
-            st.metric("Avg Profit Margin", f"{avg_profit_margin:.2f}%")
-            st.metric("Avg Discount", f"{avg_discount:.2f}%")
+        return {
+            'total_sales': float(self.df['Sales'].sum()),
+            'total_profit': float(self.df['Profit'].sum()),
+            'avg_profit_margin': float(
+                (self.df['Profit'].sum() / self.df['Sales'].sum() * 100)
+                if self.df['Sales'].sum() > 0 else 0
+            ),
+            'total_discount_leakage': float(self.df['Discount_Leakage'].sum()),
+            'total_margin_leakage': float(self.df['Margin_Leakage'].sum()),
+            'total_leakage': float(self.df['Total_Leakage'].sum()),
+            'avg_leakage_rate': float(self.df['Leakage_Rate'].mean()),
+            'negative_profit_count': int((self.df['Profit'] < 0).sum()),
+            'negative_profit_amount': float(
+                self.df.loc[self.df['Profit'] < 0, 'Profit'].sum()
+            )
+        }
 
-        with col3:
-            st.metric("Revenue Lost to Discounts", f"${revenue_lost_discount:,.2f}")
-            st.metric("Negative Profit Transactions", f"{negative_profit_count}")
+    def build_time_series(
+        self,
+        level: str = "overall",
+        groupby_col: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        Build time series aggregation at specified level.
 
-        with col4:
-            leakage_amount = revenue_lost_discount + abs(negative_profit_amount)
-            st.metric("Total Revenue Leakage", f"${leakage_amount:,.2f}",
-                     delta=f"-{(leakage_amount/total_sales*100):.2f}%", delta_color="inverse")
-            potential_savings = leakage_amount * 0.7  # Assume 70% recoverable
-            st.metric("Potential Savings", f"${potential_savings:,.2f}")
+        Args:
+            level: Aggregation level ("overall", "region", "category")
+            groupby_col: Optional specific column to group by
 
-        # Visualization: Leakage breakdown
-        st.subheader("Revenue Leakage Breakdown")
+        Returns:
+            Time series DataFrame with period index
 
-        leakage_data = pd.DataFrame({
-            'Category': ['Discount Leakage', 'Negative Profit', 'Potential Savings'],
-            'Amount': [revenue_lost_discount, abs(negative_profit_amount), potential_savings]
+        Raises:
+            ValueError: If date column not available
+        """
+        if not self.date_column:
+            raise ValueError("No date column available for time series analysis")
+
+        if not self.prepared:
+            self.prepare_data()
+
+        # Determine grouping
+        if groupby_col:
+            group_cols = ['YearMonth', groupby_col]
+        elif level == "region" and 'Region' in self.df.columns:
+            group_cols = ['YearMonth', 'Region']
+        elif level == "category" and 'Category' in self.df.columns:
+            group_cols = ['YearMonth', 'Category']
+        else:
+            group_cols = ['YearMonth']
+
+        # Aggregate
+        ts_data = self.df.groupby(group_cols).agg({
+            'Sales': 'sum',
+            'Profit': 'sum',
+            'Total_Leakage': 'sum',
+            'Discount_Leakage': 'sum',
+            'Margin_Leakage': 'sum'
+        }).reset_index()
+
+        # Compute leakage rate
+        ts_data['Leakage_Rate'] = np.where(
+            ts_data['Sales'] > 0,
+            (ts_data['Total_Leakage'] / ts_data['Sales']) * 100,
+            0
+        )
+
+        return ts_data
+
+    def forecast_leakage(
+        self,
+        forecast_periods: int = 6
+    ) -> Tuple[pd.DataFrame, Dict[str, float]]:
+        """
+        Forecast future revenue leakage using tree-based regression.
+
+        This method:
+        - Aggregates data to monthly level
+        - Engineers lag and rolling features
+        - Trains gradient boosting model with walk-forward validation
+        - Forecasts future periods
+        - Computes performance metrics
+
+        Args:
+            forecast_periods: Number of months to forecast
+
+        Returns:
+            Tuple of (forecast_df, metrics_dict)
+            - forecast_df: DataFrame with historical and forecasted values
+            - metrics_dict: Model performance metrics (MAE, RMSE, etc.)
+
+        Raises:
+            ValueError: If insufficient historical data
+        """
+        if not self.date_column:
+            raise ValueError("No date column available for forecasting")
+
+        if not self.prepared:
+            self.prepare_data()
+
+        # Build monthly time series
+        monthly_data = self.build_time_series(level="overall")
+
+        # Convert to datetime index
+        monthly_data['Date'] = monthly_data['YearMonth'].dt.to_timestamp()
+        monthly_data = monthly_data.set_index('Date').sort_index()
+
+        if len(monthly_data) < 6:
+            raise ValueError(
+                f"Insufficient data for forecasting. Need at least 6 months, "
+                f"got {len(monthly_data)}"
+            )
+
+        # Engineer features
+        monthly_data = self._add_lag_rolling_features(monthly_data)
+
+        # Drop rows with NaN (from lag/rolling features)
+        monthly_data = monthly_data.dropna()
+
+        if len(monthly_data) < 4:
+            raise ValueError("Insufficient data after feature engineering")
+
+        # Prepare features and target
+        feature_cols = ['Month', 'Quarter', 'Year']
+
+        # Add engineered features
+        monthly_data['Month'] = monthly_data.index.month
+        monthly_data['Quarter'] = monthly_data.index.quarter
+        monthly_data['Year'] = monthly_data.index.year
+
+        # Add lag and rolling features
+        for lag in self.config.lag_periods:
+            col = f'Leakage_Lag{lag}'
+            if col in monthly_data.columns:
+                feature_cols.append(col)
+
+        for window in self.config.rolling_windows:
+            col = f'Rolling_{window}M_Leakage'
+            if col in monthly_data.columns:
+                feature_cols.append(col)
+
+        X = monthly_data[feature_cols]
+        y = monthly_data['Total_Leakage']
+
+        # Time-based split
+        split_idx = int(len(X) * self.config.train_test_split)
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+        # Train model
+        model = GradientBoostingRegressor(
+            n_estimators=self.config.n_estimators,
+            random_state=self.config.random_state,
+            learning_rate=0.1,
+            max_depth=4
+        )
+        model.fit(X_train, y_train)
+
+        # Evaluate on test set
+        metrics = {}
+        if len(X_test) > 0:
+            y_pred = model.predict(X_test)
+            metrics['mae'] = float(mean_absolute_error(y_test, y_pred))
+            metrics['rmse'] = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+
+            # Compute MAPE (avoiding division by zero)
+            mask = y_test != 0
+            if mask.sum() > 0:
+                mape = np.mean(
+                    np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])
+                ) * 100
+                metrics['mape'] = float(mape)
+
+        # Generate future forecasts
+        last_date = monthly_data.index[-1]
+        future_dates = pd.date_range(
+            start=last_date + pd.DateOffset(months=1),
+            periods=forecast_periods,
+            freq='MS'
+        )
+
+        # Iteratively forecast future periods
+        future_predictions = []
+        forecast_df = monthly_data.copy()
+
+        for i, future_date in enumerate(future_dates):
+            # Build features for this future period
+            future_row = {
+                'Month': future_date.month,
+                'Quarter': future_date.quarter,
+                'Year': future_date.year
+            }
+
+            # Add lag features from recent history
+            for lag in self.config.lag_periods:
+                lag_idx = len(forecast_df) - lag
+                if lag_idx >= 0:
+                    if 'Forecast_Leakage' in forecast_df.columns:
+                        future_row[f'Leakage_Lag{lag}'] = (
+                            forecast_df.iloc[lag_idx].get('Forecast_Leakage') or
+                            forecast_df.iloc[lag_idx]['Total_Leakage']
+                        )
+                    else:
+                        future_row[f'Leakage_Lag{lag}'] = (
+                            forecast_df.iloc[lag_idx]['Total_Leakage']
+                        )
+                else:
+                    future_row[f'Leakage_Lag{lag}'] = 0
+
+            # Add rolling features
+            for window in self.config.rolling_windows:
+                window_data = forecast_df.tail(window)
+                if 'Forecast_Leakage' in window_data.columns:
+                    values = []
+                    for _, row in window_data.iterrows():
+                        values.append(
+                            row.get('Forecast_Leakage') or row['Total_Leakage']
+                        )
+                    future_row[f'Rolling_{window}M_Leakage'] = np.mean(values)
+                else:
+                    future_row[f'Rolling_{window}M_Leakage'] = (
+                        window_data['Total_Leakage'].mean()
+                    )
+
+            # Predict
+            X_future = pd.DataFrame([future_row])[feature_cols]
+            prediction = model.predict(X_future)[0]
+            future_predictions.append(prediction)
+
+            # Add to forecast_df for next iteration
+            new_row = pd.DataFrame({
+                'Total_Leakage': [0],
+                'Forecast_Leakage': [prediction]
+            }, index=[future_date])
+            forecast_df = pd.concat([forecast_df, new_row])
+
+        # Build output dataframe
+        result_df = pd.DataFrame({
+            'Date': future_dates,
+            'Forecasted_Leakage': future_predictions
         })
 
-        fig = px.bar(leakage_data, x='Category', y='Amount',
-                     title='Revenue Leakage Components',
-                     color='Category',
-                     color_discrete_map={
-                         'Discount Leakage': '#ff6b6b',
-                         'Negative Profit': '#ee5a6f',
-                         'Potential Savings': '#4ecdc4'
-                     })
+        # Add historical data
+        historical_df = pd.DataFrame({
+            'Date': monthly_data.index,
+            'Historical_Leakage': monthly_data['Total_Leakage'].values
+        })
+
+        # Combine
+        full_forecast = pd.concat([
+            historical_df.set_index('Date'),
+            result_df.set_index('Date')
+        ], axis=1).reset_index()
+        full_forecast.columns = ['Date', 'Historical_Leakage', 'Forecasted_Leakage']
+
+        # Add summary metrics
+        metrics['total_forecasted_leakage'] = float(sum(future_predictions))
+        metrics['avg_monthly_forecast'] = float(np.mean(future_predictions))
+        metrics['historical_avg'] = float(monthly_data['Total_Leakage'].mean())
+
+        return full_forecast, metrics
+
+    def _add_lag_rolling_features(self, ts_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add lag and rolling window features to time series.
+
+        Args:
+            ts_df: Time series DataFrame
+
+        Returns:
+            DataFrame with additional lag and rolling features
+        """
+        df = ts_df.copy()
+
+        # Lag features
+        for lag in self.config.lag_periods:
+            df[f'Leakage_Lag{lag}'] = df['Total_Leakage'].shift(lag)
+
+        # Rolling features
+        for window in self.config.rolling_windows:
+            df[f'Rolling_{window}M_Leakage'] = (
+                df['Total_Leakage'].rolling(window=window, min_periods=1).mean()
+            )
+
+        return df
+
+    def detect_anomalies(
+        self,
+        contamination: float = 0.05
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Detect anomalous transactions using regression residuals and IsolationForest.
+
+        This method:
+        - Trains a regression model to predict expected profit
+        - Computes residuals (expected - actual)
+        - Identifies anomalies where residual is high AND profit is low
+        - Optionally combines with IsolationForest
+
+        Args:
+            contamination: Expected proportion of outliers (0-1)
+
+        Returns:
+            Tuple of (anomalies_df, summary_dict)
+            - anomalies_df: DataFrame of detected anomalies
+            - summary_dict: Summary statistics
+        """
+        if not self.prepared:
+            self.prepare_data()
+
+        # Prepare features
+        feature_cols = ['Sales', 'Profit', 'Profit_Margin',
+                       'Margin_Leakage', 'Total_Leakage']
+
+        if 'Discount' in self.df.columns:
+            feature_cols.append('Discount')
+
+        # Encode categorical features
+        categorical_cols = []
+        df_encoded = self.df.copy()
+
+        for col in ['Category', 'Sub Category', 'Region', 'Customer Segment']:
+            if col in df_encoded.columns:
+                le = LabelEncoder()
+                df_encoded[f'{col}_Encoded'] = le.fit_transform(
+                    df_encoded[col].astype(str)
+                )
+                feature_cols.append(f'{col}_Encoded')
+                categorical_cols.append(col)
+
+        # Drop NaN
+        df_features = df_encoded[feature_cols].dropna()
+
+        if len(df_features) < 100:
+            raise ValueError("Insufficient data for anomaly detection (need >= 100 records)")
+
+        # Train regression model to predict expected profit margin
+        X = df_features.drop(['Profit'], axis=1, errors='ignore')
+        y = df_features['Profit']
+
+        # Use 80% for training
+        split_idx = int(len(X) * 0.8)
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+        model = GradientBoostingRegressor(
+            n_estimators=100,
+            random_state=self.config.random_state,
+            max_depth=4
+        )
+        model.fit(X_train, y_train)
+
+        # Predict on full dataset
+        y_pred_all = model.predict(X)
+
+        # Compute residuals
+        residuals = y_pred_all - y.values
+        df_features['Residual'] = residuals
+        df_features['Expected_Profit_Model'] = y_pred_all
+
+        # Define anomaly threshold based on residuals
+        residual_threshold = np.percentile(residuals, self.config.anomaly_percentile * 100)
+
+        # Anomalies: high residual AND low/negative actual profit
+        df_features['Is_Anomaly_Residual'] = (
+            (df_features['Residual'] > residual_threshold) &
+            (df_features['Profit'] < df_features['Profit'].quantile(0.25))
+        )
+
+        # Apply IsolationForest
+        iso_forest = IsolationForest(
+            contamination=contamination,
+            random_state=self.config.random_state
+        )
+        iso_predictions = iso_forest.fit_predict(X)
+        df_features['Is_Anomaly_ISO'] = (iso_predictions == -1)
+
+        # Combine both methods
+        df_features['Is_Anomaly'] = (
+            df_features['Is_Anomaly_Residual'] | df_features['Is_Anomaly_ISO']
+        )
+
+        # Anomaly score (normalized residual)
+        df_features['Anomaly_Score'] = (
+            (df_features['Residual'] - residuals.mean()) / residuals.std()
+        )
+
+        # Get original data for anomalies
+        anomaly_indices = df_features[df_features['Is_Anomaly']].index
+        anomalies_full = self.df.loc[anomaly_indices].copy()
+
+        # Add anomaly metrics
+        anomalies_full['Residual'] = df_features.loc[anomaly_indices, 'Residual']
+        anomalies_full['Anomaly_Score'] = df_features.loc[anomaly_indices, 'Anomaly_Score']
+
+        # Add flags
+        anomalies_full['Flags'] = anomalies_full.apply(
+            lambda row: self._generate_anomaly_flags(row), axis=1
+        )
+
+        # Summary
+        summary = {
+            'total_transactions': len(self.df),
+            'anomaly_count': len(anomalies_full),
+            'anomaly_percentage': len(anomalies_full) / len(self.df) * 100,
+            'total_sales_at_risk': float(anomalies_full['Sales'].sum()),
+            'total_leakage_in_anomalies': float(anomalies_full['Total_Leakage'].sum()),
+            'avg_anomaly_score': float(anomalies_full['Anomaly_Score'].mean()),
+            'residual_threshold': float(residual_threshold)
+        }
+
+        return anomalies_full, summary
+
+    def _generate_anomaly_flags(self, row: pd.Series) -> str:
+        """Generate descriptive flags for anomaly."""
+        flags = []
+
+        if row.get('Profit', 0) < 0:
+            flags.append('NEGATIVE_PROFIT')
+
+        if 'Discount' in row and row.get('Discount', 0) > self.config.high_discount_threshold:
+            flags.append('HIGH_DISCOUNT')
+
+        if row.get('Profit_Margin', 0) < self.config.low_margin_threshold * 100:
+            flags.append('LOW_MARGIN')
+
+        if row.get('Margin_Leakage', 0) > row.get('Expected_Profit', 0) * 0.5:
+            flags.append('HIGH_MARGIN_LEAKAGE')
+
+        return ', '.join(flags) if flags else 'OUTLIER'
+
+    def score_leakage_risk(self) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Score each transaction for leakage risk using classification.
+
+        Trains a binary classifier to predict probability of significant leakage.
+
+        Returns:
+            Tuple of (risk_scores_df, metadata_dict)
+            - risk_scores_df: DataFrame with leakage probabilities
+            - metadata_dict: Feature importance and model info
+        """
+        if not self.prepared:
+            self.prepare_data()
+
+        # Create binary target: high leakage flag
+        leakage_threshold = self.df['Total_Leakage'].quantile(0.75)
+        self.df['Leakage_Flag'] = (
+            (self.df['Total_Leakage'] > leakage_threshold) |
+            (self.df['Profit_Margin'] < 0)
+        ).astype(int)
+
+        # Prepare features
+        feature_cols = ['Sales', 'Profit_Margin']
+
+        if 'Discount' in self.df.columns:
+            feature_cols.append('Discount')
+
+        # Encode categoricals
+        df_encoded = self.df.copy()
+        for col in ['Category', 'Sub Category', 'Region', 'Customer Segment']:
+            if col in df_encoded.columns:
+                le = LabelEncoder()
+                df_encoded[f'{col}_Encoded'] = le.fit_transform(
+                    df_encoded[col].astype(str)
+                )
+                feature_cols.append(f'{col}_Encoded')
+
+        # Prepare dataset
+        df_model = df_encoded[feature_cols + ['Leakage_Flag']].dropna()
+
+        X = df_model[feature_cols]
+        y = df_model['Leakage_Flag']
+
+        # Train classifier
+        clf = GradientBoostingClassifier(
+            n_estimators=self.config.n_estimators,
+            random_state=self.config.random_state,
+            max_depth=4
+        )
+        clf.fit(X, y)
+
+        # Predict probabilities
+        leakage_probs = clf.predict_proba(X)[:, 1]
+
+        # Build result dataframe
+        result_df = self.df.loc[df_model.index].copy()
+        result_df['Leakage_Probability'] = leakage_probs
+
+        # Feature importance
+        feature_importance = pd.DataFrame({
+            'Feature': feature_cols,
+            'Importance': clf.feature_importances_
+        }).sort_values('Importance', ascending=False)
+
+        # Metadata
+        metadata = {
+            'feature_importance': feature_importance.to_dict('records'),
+            'high_risk_count': int((leakage_probs > 0.7).sum()),
+            'medium_risk_count': int(((leakage_probs > 0.4) & (leakage_probs <= 0.7)).sum()),
+            'low_risk_count': int((leakage_probs <= 0.4).sum()),
+            'avg_probability': float(leakage_probs.mean())
+        }
+
+        return result_df, metadata
+
+
+# ============================================================================
+# LLM Insight Generator
+# ============================================================================
+
+class LLMInsightGenerator:
+    """
+    Handles LLM-based narrative insight generation.
+
+    This class wraps LLM client interactions and provides structured
+    methods for generating business insights from numeric data.
+
+    Important: This class NEVER asks the LLM to do numeric calculations.
+    It only passes computed numbers and asks for interpretation.
+    """
+
+    def __init__(self, llm_client: Any):
+        """
+        Initialize with LLM client.
+
+        Args:
+            llm_client: LLM client with conversational_response method
+        """
+        self.llm = llm_client
+
+    def _call_llm(self, prompt: str, timeout: int = 30) -> str:
+        """
+        Safely call LLM with error handling.
+
+        Args:
+            prompt: Prompt text
+            timeout: Timeout in seconds
+
+        Returns:
+            LLM response text or error message
+        """
+        try:
+            response = self.llm.conversational_response([
+                {'sender': 'user', 'text': prompt}
+            ])
+            return response.get('text', 'No response generated')
+        except Exception as e:
+            return f"⚠️ Error generating insights: {str(e)}"
+
+    def generate_executive_summary(self, metrics: Dict[str, float]) -> str:
+        """
+        Generate executive summary insights from metrics.
+
+        Args:
+            metrics: Dictionary of computed metrics
+
+        Returns:
+            Executive summary text
+        """
+        prompt = f"""
+As a business analyst, provide a concise executive summary of this revenue leakage analysis.
+
+**Key Metrics:**
+- Total Sales: ${metrics.get('total_sales', 0):,.2f}
+- Total Profit: ${metrics.get('total_profit', 0):,.2f}
+- Average Profit Margin: {metrics.get('avg_profit_margin', 0):.2f}%
+- Total Revenue Leakage: ${metrics.get('total_leakage', 0):,.2f}
+- Discount Leakage: ${metrics.get('total_discount_leakage', 0):,.2f}
+- Margin Leakage: ${metrics.get('total_margin_leakage', 0):,.2f}
+- Negative Profit Transactions: {metrics.get('negative_profit_count', 0)}
+
+**Please provide:**
+1. **Top 3 Critical Findings** (bullet points)
+2. **Impact Assessment** (1-2 sentences on business impact)
+3. **Priority Areas** (what needs immediate attention)
+
+Keep it concise and business-focused.
+"""
+        return self._call_llm(prompt)
+
+    def generate_discount_insights(
+        self,
+        discount_stats: Dict[str, float],
+        category_stats: Optional[pd.DataFrame] = None
+    ) -> str:
+        """
+        Generate insights on discount patterns.
+
+        Args:
+            discount_stats: Discount distribution statistics
+            category_stats: Optional category-level discount stats
+
+        Returns:
+            Discount insights text
+        """
+        category_info = ""
+        if category_stats is not None and not category_stats.empty:
+            top_3 = category_stats.head(3)
+            category_info = "\n**Top 3 Categories by Discount Leakage:**\n"
+            for idx, row in top_3.iterrows():
+                category_info += f"- {idx}: ${row.get('Discount_Leakage', 0):,.2f}\n"
+
+        prompt = f"""
+Analyze these discount patterns and provide strategic insights:
+
+**Discount Statistics:**
+- Average Discount Rate: {discount_stats.get('mean', 0):.2%}
+- Median Discount: {discount_stats.get('50%', 0):.2%}
+- Max Discount: {discount_stats.get('max', 0):.2%}
+- High Discount (>20%) Transactions: {discount_stats.get('high_discount_count', 0)}
+- Revenue Lost to High Discounts: ${discount_stats.get('high_discount_loss', 0):,.2f}
+
+{category_info}
+
+**Please provide:**
+1. Are current discount levels sustainable or excessive?
+2. Which categories show problematic discount patterns?
+3. Specific recommendations for discount optimization
+
+Be specific and actionable.
+"""
+        return self._call_llm(prompt)
+
+    def generate_forecast_insights(self, forecast_summary: Dict[str, float]) -> str:
+        """
+        Generate insights on leakage forecast.
+
+        Args:
+            forecast_summary: Forecast metrics and trends
+
+        Returns:
+            Forecast insights text
+        """
+        trend = "increasing" if (
+            forecast_summary.get('avg_monthly_forecast', 0) >
+            forecast_summary.get('historical_avg', 0)
+        ) else "decreasing"
+
+        prompt = f"""
+Analyze this revenue leakage forecast and provide strategic insights:
+
+**Forecast Summary:**
+- Historical Average Monthly Leakage: ${forecast_summary.get('historical_avg', 0):,.2f}
+- Forecasted Average Monthly Leakage: ${forecast_summary.get('avg_monthly_forecast', 0):,.2f}
+- Total Forecasted Leakage: ${forecast_summary.get('total_forecasted_leakage', 0):,.2f}
+- Trend Direction: {trend}
+- Model MAE: ${forecast_summary.get('mae', 0):,.2f}
+- Model RMSE: ${forecast_summary.get('rmse', 0):,.2f}
+
+**Please provide:**
+1. **Trend Analysis**: What does the forecast tell us about future leakage?
+2. **Business Impact**: Potential financial implications
+3. **Preventive Actions**: Specific steps to mitigate forecasted leakage
+
+Keep it concise and actionable.
+"""
+        return self._call_llm(prompt)
+
+    def generate_recommendations(
+        self,
+        summary: Dict[str, Any],
+        top_categories: Optional[List[str]] = None,
+        top_regions: Optional[List[str]] = None
+    ) -> str:
+        """
+        Generate comprehensive recommendations.
+
+        Args:
+            summary: Overall analysis summary
+            top_categories: List of worst-performing categories
+            top_regions: List of worst-performing regions
+
+        Returns:
+            Comprehensive recommendations text
+        """
+        category_info = ""
+        if top_categories:
+            category_info = f"\n**Worst Performing Categories:** {', '.join(top_categories)}"
+
+        region_info = ""
+        if top_regions:
+            region_info = f"\n**Worst Performing Regions:** {', '.join(top_regions)}"
+
+        prompt = f"""
+As a business strategy consultant, provide detailed, actionable recommendations to reduce revenue leakage.
+
+**Current Situation:**
+- Total Sales: ${summary.get('total_sales', 0):,.2f}
+- Total Profit: ${summary.get('total_profit', 0):,.2f}
+- Total Revenue Leakage: ${summary.get('total_leakage', 0):,.2f}
+- Average Profit Margin: {summary.get('avg_profit_margin', 0):.2f}%
+- Negative Profit Transactions: {summary.get('negative_profit_count', 0)}
+{category_info}
+{region_info}
+
+**Please provide structured recommendations:**
+
+### 1. Immediate Actions (0-30 days)
+- Quick wins to stop leakage
+- Emergency measures
+
+### 2. Short-term Strategy (1-3 months)
+- Pricing optimization
+- Discount policy improvements
+- Product mix adjustments
+
+### 3. Long-term Strategy (3-12 months)
+- Strategic business model changes
+- Portfolio restructuring
+
+### 4. Key Metrics to Track
+- Specific KPIs
+- Target values
+
+### 5. Expected Impact
+- Revenue recovery potential
+- Timeline for results
+
+Be specific, quantify where possible, and prioritize by impact.
+"""
+        return self._call_llm(prompt)
+
+
+# ============================================================================
+# Streamlit UI Layer
+# ============================================================================
+
+def run_revenue_leakage_app(df: pd.DataFrame, llm_client: Any) -> None:
+    """
+    Main Streamlit application for revenue leakage analysis.
+
+    Args:
+        df: Input DataFrame
+        llm_client: LLM client instance
+    """
+    st.header("🔍 AI-Powered Revenue Leakage Analysis")
+    st.markdown("""
+    Comprehensive revenue leakage detection across discounting, profitability,
+    product performance, regional trends, and predictive forecasting.
+    """)
+
+    # Configuration sidebar
+    with st.sidebar:
+        st.subheader("⚙️ Configuration")
+
+        target_margin = st.slider(
+            "Target Profit Margin (%)",
+            5, 30, 15,
+            help="Expected profit margin target"
+        ) / 100
+
+        high_discount_thresh = st.slider(
+            "High Discount Threshold (%)",
+            10, 40, 20,
+            help="Threshold for flagging high discounts"
+        ) / 100
+
+        forecast_horizon = st.slider(
+            "Forecast Horizon (months)",
+            3, 12, 6,
+            help="Number of months to forecast"
+        )
+
+        anomaly_sensitivity = st.slider(
+            "Anomaly Detection Sensitivity (%)",
+            1, 20, 5,
+            help="Expected percentage of outliers"
+        ) / 100
+
+    # Create configuration
+    config = RevenueLeakageConfig(
+        target_margin=target_margin,
+        high_discount_threshold=high_discount_thresh,
+        forecast_horizon=forecast_horizon
+    )
+
+    # Initialize analyzer
+    try:
+        analyzer = RevenueLeakageAnalyzer(df, config)
+        analyzer.prepare_data()
+        llm_generator = LLMInsightGenerator(llm_client)
+    except ValueError as e:
+        st.error(f"❌ Data validation error: {str(e)}")
+        return
+
+    # Create tabs
+    tabs = st.tabs([
+        "📊 Executive Summary",
+        "💰 Discount Analysis",
+        "📉 Profit Erosion",
+        "📦 Product Performance",
+        "🌍 Regional Analysis",
+        "🔮 Forecasting",
+        "📈 Anomaly Detection",
+        "📋 Recommendations"
+    ])
+
+    with tabs[0]:
+        _render_executive_summary(analyzer, llm_generator)
+
+    with tabs[1]:
+        _render_discount_analysis(analyzer, llm_generator)
+
+    with tabs[2]:
+        _render_profit_erosion(analyzer)
+
+    with tabs[3]:
+        _render_product_performance(analyzer)
+
+    with tabs[4]:
+        _render_regional_analysis(analyzer)
+
+    with tabs[5]:
+        _render_forecasting(analyzer, llm_generator, forecast_horizon)
+
+    with tabs[6]:
+        _render_anomaly_detection(analyzer, anomaly_sensitivity)
+
+    with tabs[7]:
+        _render_recommendations(analyzer, llm_generator)
+
+
+def _render_executive_summary(
+    analyzer: RevenueLeakageAnalyzer,
+    llm_gen: LLMInsightGenerator
+) -> None:
+    """Render executive summary tab."""
+    st.subheader("📊 Executive Summary - Revenue Leakage Overview")
+
+    # Compute metrics
+    metrics = analyzer.compute_leakage_metrics()
+
+    # Display key metrics
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric("Total Sales", f"${metrics['total_sales']:,.2f}")
+        st.metric("Total Profit", f"${metrics['total_profit']:,.2f}")
+
+    with col2:
+        st.metric("Avg Profit Margin", f"{metrics['avg_profit_margin']:.2f}%")
+        avg_discount = (
+            analyzer.df['Discount'].mean() * 100
+            if 'Discount' in analyzer.df.columns else 0
+        )
+        st.metric("Avg Discount", f"{avg_discount:.2f}%")
+
+    with col3:
+        st.metric(
+            "Discount Leakage",
+            f"${metrics['total_discount_leakage']:,.2f}"
+        )
+        st.metric(
+            "Margin Leakage",
+            f"${metrics['total_margin_leakage']:,.2f}"
+        )
+
+    with col4:
+        st.metric(
+            "Total Revenue Leakage",
+            f"${metrics['total_leakage']:,.2f}",
+            delta=f"-{metrics['avg_leakage_rate']:.2f}%",
+            delta_color="inverse"
+        )
+        potential_savings = metrics['total_leakage'] * 0.7
+        st.metric("Potential Savings (70%)", f"${potential_savings:,.2f}")
+
+    # Visualization
+    st.subheader("Revenue Leakage Breakdown")
+
+    leakage_data = pd.DataFrame({
+        'Category': ['Discount Leakage', 'Margin Leakage', 'Potential Savings'],
+        'Amount': [
+            metrics['total_discount_leakage'],
+            metrics['total_margin_leakage'],
+            potential_savings
+        ]
+    })
+
+    fig = px.bar(
+        leakage_data,
+        x='Category',
+        y='Amount',
+        title='Revenue Leakage Components',
+        color='Category',
+        color_discrete_map={
+            'Discount Leakage': '#ff6b6b',
+            'Margin Leakage': '#ee5a6f',
+            'Potential Savings': '#4ecdc4'
+        }
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # AI insights
+    st.subheader("🤖 AI-Generated Executive Insights")
+    with st.spinner("Generating insights..."):
+        insights = llm_gen.generate_executive_summary(metrics)
+    st.write(insights)
+
+
+def _render_discount_analysis(
+    analyzer: RevenueLeakageAnalyzer,
+    llm_gen: LLMInsightGenerator
+) -> None:
+    """Render discount analysis tab."""
+    st.subheader("💰 Discount-Driven Revenue Leakage Analysis")
+
+    if 'Discount' not in analyzer.df.columns:
+        st.warning("⚠️ No discount data available in the dataset")
+        return
+
+    # Discount distribution
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### Discount Distribution")
+        fig = px.histogram(
+            analyzer.df,
+            x='Discount',
+            nbins=50,
+            title='Distribution of Discount Rates',
+            labels={'Discount': 'Discount Rate', 'count': 'Frequency'}
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        # AI-generated insights
-        st.subheader("🤖 AI-Generated Executive Insights")
-        summary_prompt = f"""
-        Analyze this business revenue leakage summary and provide executive-level insights:
+    with col2:
+        st.markdown("#### High Discount Impact")
+        high_discount = analyzer.df[
+            analyzer.df['Discount'] > analyzer.config.high_discount_threshold
+        ]
+        high_discount_loss = high_discount['Discount_Leakage'].sum()
 
-        - Total Sales: ${total_sales:,.2f}
-        - Total Profit: ${total_profit:,.2f}
-        - Average Profit Margin: {avg_profit_margin:.2f}%
-        - Average Discount: {avg_discount:.2f}%
-        - Revenue Lost to Discounts: ${revenue_lost_discount:,.2f}
-        - Negative Profit Transactions: {negative_profit_count}
-        - Total Negative Profit Amount: ${negative_profit_amount:,.2f}
-        - Total Revenue Leakage: ${leakage_amount:,.2f}
+        st.metric(
+            f"Transactions with >{analyzer.config.high_discount_threshold*100:.0f}% Discount",
+            len(high_discount)
+        )
+        st.metric("Revenue Lost (High Discounts)", f"${high_discount_loss:,.2f}")
 
-        Provide:
-        1. Top 3 critical findings
-        2. Impact assessment
-        3. Priority areas for immediate action
-        """
+        # Category breakdown
+        if 'Category' in analyzer.df.columns:
+            st.markdown("##### Discount by Category")
+            discount_by_cat = analyzer.df.groupby('Category').agg({
+                'Discount': 'mean',
+                'Discount_Leakage': 'sum'
+            }).sort_values('Discount_Leakage', ascending=False)
 
-        with st.spinner("Generating AI insights..."):
-            insights = self.llm.conversational_response([{'sender': 'user', 'text': summary_prompt}])['text']
-        st.write(insights)
-
-    def analyze_discount_leakage(self):
-        """Analyze revenue leakage due to discounting patterns"""
-        st.subheader("💰 Discount-Driven Revenue Leakage Analysis")
-
-        if 'Discount' not in self.data.columns:
-            st.warning("No discount data available in the dataset")
-            return
-
-        # Discount distribution
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("#### Discount Distribution")
-            fig = px.histogram(self.data, x='Discount', nbins=50,
-                             title='Distribution of Discount Rates',
-                             labels={'Discount': 'Discount Rate', 'count': 'Frequency'})
-            st.plotly_chart(fig, use_container_width=True)
-
-        with col2:
-            st.markdown("#### High Discount Transactions")
-            high_discount = self.data[self.data['Discount'] > 0.2]  # >20% discount
-            high_discount_loss = high_discount['Revenue_Lost_to_Discount'].sum()
-
-            st.metric("Transactions with >20% Discount", len(high_discount))
-            st.metric("Revenue Lost (>20% discount)", f"${high_discount_loss:,.2f}")
-
-            # Discount by category
-            if 'Category' in self.data.columns:
-                discount_by_cat = self.data.groupby('Category').agg({
-                    'Discount': 'mean',
-                    'Revenue_Lost_to_Discount': 'sum'
-                }).sort_values('Revenue_Lost_to_Discount', ascending=False)
-                st.dataframe(discount_by_cat.style.format({
+            st.dataframe(
+                discount_by_cat.style.format({
                     'Discount': '{:.2%}',
-                    'Revenue_Lost_to_Discount': '${:,.2f}'
-                }))
+                    'Discount_Leakage': '${:,.2f}'
+                }),
+                height=200
+            )
 
-        # Discount vs Profit analysis
-        st.markdown("#### Discount Impact on Profitability")
+    # Discount vs Profit
+    st.markdown("#### Discount Impact on Profitability")
 
-        if 'Profit_Margin' in self.data.columns:
-            fig = px.scatter(self.data.sample(min(1000, len(self.data))),
-                           x='Discount', y='Profit_Margin',
-                           color='Category' if 'Category' in self.data.columns else None,
-                           title='Discount Rate vs Profit Margin',
-                           labels={'Discount': 'Discount Rate', 'Profit_Margin': 'Profit Margin (%)'})
-            st.plotly_chart(fig, use_container_width=True)
+    sample_size = min(1000, len(analyzer.df))
+    sample_df = analyzer.df.sample(sample_size, random_state=42)
 
-        # AI Insights
-        st.markdown("#### 🤖 AI-Generated Discount Insights")
-        discount_stats = self.data['Discount'].describe()
-        discount_prompt = f"""
-        Analyze this discount pattern data:
+    fig = px.scatter(
+        sample_df,
+        x='Discount',
+        y='Profit_Margin',
+        color='Category' if 'Category' in sample_df.columns else None,
+        title='Discount Rate vs Profit Margin',
+        labels={'Discount': 'Discount Rate', 'Profit_Margin': 'Profit Margin (%)'}
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-        {discount_stats.to_string()}
+    # AI insights
+    st.markdown("#### 🤖 AI-Generated Discount Insights")
 
-        High discount transactions (>20%): {len(high_discount)}
-        Revenue lost to high discounts: ${high_discount_loss:,.2f}
+    discount_stats = {
+        'mean': analyzer.df['Discount'].mean(),
+        '50%': analyzer.df['Discount'].median(),
+        'max': analyzer.df['Discount'].max(),
+        'high_discount_count': len(high_discount),
+        'high_discount_loss': high_discount_loss
+    }
 
-        Provide insights on:
-        1. Are discounts excessive or justified?
-        2. Which product categories have problematic discount patterns?
-        3. Specific recommendations to optimize discount strategy
-        """
+    category_stats = None
+    if 'Category' in analyzer.df.columns:
+        category_stats = analyzer.df.groupby('Category')['Discount_Leakage'].sum().sort_values(ascending=False)
 
-        with st.spinner("Analyzing discount patterns..."):
-            insights = self.llm.conversational_response([{'sender': 'user', 'text': discount_prompt}])['text']
-        st.write(insights)
+    with st.spinner("Analyzing discount patterns..."):
+        insights = llm_gen.generate_discount_insights(discount_stats, category_stats)
+    st.write(insights)
 
-    def analyze_profit_erosion(self):
-        """Analyze profit margin erosion over time"""
-        st.subheader("📉 Profit Margin Erosion Analysis")
 
-        if 'Profit_Margin' not in self.data.columns:
-            st.warning("Unable to calculate profit margins")
-            return
+def _render_profit_erosion(analyzer: RevenueLeakageAnalyzer) -> None:
+    """Render profit erosion analysis tab."""
+    st.subheader("📉 Profit Margin Erosion Analysis")
 
-        # Identify date column
-        date_col = None
-        for col in self.data.columns:
-            if 'date' in col.lower() and pd.api.types.is_datetime64_any_dtype(self.data[col]):
-                date_col = col
-                break
+    # Time series if available
+    if analyzer.date_column:
+        try:
+            ts_data = analyzer.build_time_series(level="overall")
+            ts_data['Date'] = ts_data['YearMonth'].dt.to_timestamp()
 
-        if date_col:
-            # Time series analysis of profit margin
-            time_data = self.data.sort_values(date_col)
-            time_data['Year_Month'] = time_data[date_col].dt.to_period('M')
+            # Compute profit margin for time series
+            ts_data['Profit_Margin'] = np.where(
+                ts_data['Sales'] > 0,
+                (ts_data['Profit'] / ts_data['Sales']) * 100,
+                0
+            )
 
-            monthly_metrics = time_data.groupby('Year_Month').agg({
-                'Sales': 'sum',
-                'Profit': 'sum',
-                'Profit_Margin': 'mean'
-            })
-            monthly_metrics.index = monthly_metrics.index.to_timestamp()
-
-            # Plot profit margin trend
+            # Plot trend
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=monthly_metrics.index, y=monthly_metrics['Profit_Margin'],
-                                   mode='lines+markers', name='Avg Profit Margin',
-                                   line=dict(color='#4ecdc4', width=3)))
-            fig.update_layout(title='Profit Margin Trend Over Time',
-                            xaxis_title='Date',
-                            yaxis_title='Profit Margin (%)')
+            fig.add_trace(go.Scatter(
+                x=ts_data['Date'],
+                y=ts_data['Profit_Margin'],
+                mode='lines+markers',
+                name='Avg Profit Margin',
+                line=dict(color='#4ecdc4', width=3)
+            ))
+            fig.update_layout(
+                title='Profit Margin Trend Over Time',
+                xaxis_title='Date',
+                yaxis_title='Profit Margin (%)'
+            )
             st.plotly_chart(fig, use_container_width=True)
 
-            # Calculate trend
-            monthly_metrics['Period_Num'] = range(len(monthly_metrics))
-            if len(monthly_metrics) > 2:
+            # Trend analysis
+            if len(ts_data) > 2:
                 from scipy import stats
-                slope, intercept, r_value, p_value, std_err = stats.linregress(
-                    monthly_metrics['Period_Num'], monthly_metrics['Profit_Margin']
+                ts_data['Period_Num'] = range(len(ts_data))
+                slope, _, _, _, _ = stats.linregress(
+                    ts_data['Period_Num'],
+                    ts_data['Profit_Margin']
                 )
 
-                trend_direction = "increasing" if slope > 0 else "decreasing"
-                st.info(f"📊 Profit margin trend: **{trend_direction}** at {abs(slope):.2f}% per month")
+                trend_direction = "increasing ⬆️" if slope > 0 else "decreasing ⬇️"
+                st.info(
+                    f"📊 Profit margin trend: **{trend_direction}** "
+                    f"at {abs(slope):.2f}% per month"
+                )
+        except Exception as e:
+            st.warning(f"Could not generate time series: {str(e)}")
 
-        # Profit margin distribution
-        col1, col2 = st.columns(2)
+    # Distribution
+    col1, col2 = st.columns(2)
 
-        with col1:
-            st.markdown("#### Profit Margin Distribution")
-            fig = px.histogram(self.data, x='Profit_Margin', nbins=50,
-                             title='Distribution of Profit Margins')
-            st.plotly_chart(fig, use_container_width=True)
+    with col1:
+        st.markdown("#### Profit Margin Distribution")
+        fig = px.histogram(
+            analyzer.df,
+            x='Profit_Margin',
+            nbins=50,
+            title='Distribution of Profit Margins'
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        with col2:
-            st.markdown("#### Low/Negative Margin Analysis")
-            low_margin = self.data[self.data['Profit_Margin'] < 5]  # <5% margin
-            negative_margin = self.data[self.data['Profit_Margin'] < 0]
+    with col2:
+        st.markdown("#### Low/Negative Margin Analysis")
+        low_margin = analyzer.df[
+            analyzer.df['Profit_Margin'] < analyzer.config.low_margin_threshold * 100
+        ]
+        negative_margin = analyzer.df[analyzer.df['Profit_Margin'] < 0]
 
-            st.metric("Transactions with <5% Margin", len(low_margin))
-            st.metric("Negative Margin Transactions", len(negative_margin))
-            st.metric("Total Loss (Negative Margin)",
-                     f"${negative_margin['Profit'].sum():,.2f}" if len(negative_margin) > 0 else "$0.00")
+        st.metric(
+            f"Transactions with <{analyzer.config.low_margin_threshold*100:.0f}% Margin",
+            len(low_margin)
+        )
+        st.metric("Negative Margin Transactions", len(negative_margin))
+        st.metric(
+            "Total Loss (Negative Margin)",
+            f"${negative_margin['Profit'].sum():,.2f}" if len(negative_margin) > 0 else "$0.00"
+        )
 
-        # Category-wise profit analysis
-        if 'Category' in self.data.columns:
-            st.markdown("#### Category-wise Profit Performance")
-            cat_profit = self.data.groupby('Category').agg({
-                'Sales': 'sum',
-                'Profit': 'sum',
-                'Profit_Margin': 'mean'
-            }).sort_values('Profit_Margin')
+    # Category analysis
+    if 'Category' in analyzer.df.columns:
+        st.markdown("#### Category-wise Profit Performance")
 
-            fig = px.bar(cat_profit.reset_index(), x='Category', y='Profit_Margin',
-                        title='Average Profit Margin by Category',
-                        color='Profit_Margin',
-                        color_continuous_scale='RdYlGn')
-            st.plotly_chart(fig, use_container_width=True)
+        cat_profit = analyzer.df.groupby('Category').agg({
+            'Sales': 'sum',
+            'Profit': 'sum',
+            'Profit_Margin': 'mean'
+        }).sort_values('Profit_Margin')
 
-            st.dataframe(cat_profit.style.format({
+        fig = px.bar(
+            cat_profit.reset_index(),
+            x='Category',
+            y='Profit_Margin',
+            title='Average Profit Margin by Category',
+            color='Profit_Margin',
+            color_continuous_scale='RdYlGn'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(
+            cat_profit.style.format({
                 'Sales': '${:,.2f}',
                 'Profit': '${:,.2f}',
                 'Profit_Margin': '{:.2f}%'
-            }))
+            })
+        )
 
-    def analyze_product_performance(self):
-        """Analyze underperforming products and categories"""
-        st.subheader("📦 Product & Category Performance Analysis")
 
-        if 'Category' in self.data.columns and 'Sub Category' in self.data.columns:
-            # Category performance
-            cat_performance = self.data.groupby('Category').agg({
-                'Sales': 'sum',
-                'Profit': 'sum',
-                'Discount': 'mean'
-            }).sort_values('Profit')
+def _render_product_performance(analyzer: RevenueLeakageAnalyzer) -> None:
+    """Render product performance analysis tab."""
+    st.subheader("📦 Product & Category Performance Analysis")
 
-            cat_performance['Profit_Margin'] = (cat_performance['Profit'] / cat_performance['Sales'] * 100)
+    if 'Category' not in analyzer.df.columns:
+        st.warning("⚠️ No category data available")
+        return
 
-            # Visualize category performance
-            fig = px.scatter(cat_performance.reset_index(),
-                           x='Sales', y='Profit',
-                           size='Discount',
-                           color='Profit_Margin',
-                           hover_data=['Category'],
-                           title='Category Performance: Sales vs Profit',
-                           color_continuous_scale='RdYlGn')
-            st.plotly_chart(fig, use_container_width=True)
+    # Category performance
+    cat_performance = analyzer.df.groupby('Category').agg({
+        'Sales': 'sum',
+        'Profit': 'sum',
+        'Discount': 'mean' if 'Discount' in analyzer.df.columns else lambda x: 0
+    }).sort_values('Profit')
 
-            # Top and bottom performers
-            col1, col2 = st.columns(2)
+    cat_performance['Profit_Margin'] = np.where(
+        cat_performance['Sales'] > 0,
+        (cat_performance['Profit'] / cat_performance['Sales']) * 100,
+        0
+    )
 
-            with col1:
-                st.markdown("#### 🌟 Top Performing Categories")
-                top_cats = cat_performance.nlargest(5, 'Profit')
-                st.dataframe(top_cats.style.format({
-                    'Sales': '${:,.2f}',
-                    'Profit': '${:,.2f}',
-                    'Discount': '{:.2%}',
-                    'Profit_Margin': '{:.2f}%'
-                }).background_gradient(cmap='Greens', subset=['Profit']))
+    # Scatter plot
+    fig = px.scatter(
+        cat_performance.reset_index(),
+        x='Sales',
+        y='Profit',
+        size='Discount' if 'Discount' in analyzer.df.columns else None,
+        color='Profit_Margin',
+        hover_data=['Category'],
+        title='Category Performance: Sales vs Profit',
+        color_continuous_scale='RdYlGn'
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-            with col2:
-                st.markdown("#### ⚠️ Bottom Performing Categories")
-                bottom_cats = cat_performance.nsmallest(5, 'Profit')
-                st.dataframe(bottom_cats.style.format({
-                    'Sales': '${:,.2f}',
-                    'Profit': '${:,.2f}',
-                    'Discount': '{:.2%}',
-                    'Profit_Margin': '{:.2f}%'
-                }).background_gradient(cmap='Reds', subset=['Profit']))
+    # Top and bottom performers
+    col1, col2 = st.columns(2)
 
-            # Sub-category analysis
-            st.markdown("#### Sub-Category Deep Dive")
-            subcat_performance = self.data.groupby('Sub Category').agg({
-                'Sales': 'sum',
-                'Profit': 'sum',
-                'Discount': 'mean'
-            }).sort_values('Profit')
-
-            subcat_performance['Profit_Margin'] = (subcat_performance['Profit'] / subcat_performance['Sales'] * 100)
-
-            # Filter options
-            filter_option = st.radio("Show:", ["All", "Profitable Only", "Loss-Making Only"])
-
-            if filter_option == "Profitable Only":
-                subcat_display = subcat_performance[subcat_performance['Profit'] > 0]
-            elif filter_option == "Loss-Making Only":
-                subcat_display = subcat_performance[subcat_performance['Profit'] < 0]
-            else:
-                subcat_display = subcat_performance
-
-            st.dataframe(subcat_display.style.format({
+    with col1:
+        st.markdown("#### 🌟 Top Performing Categories")
+        top_cats = cat_performance.nlargest(5, 'Profit')
+        st.dataframe(
+            top_cats.style.format({
                 'Sales': '${:,.2f}',
                 'Profit': '${:,.2f}',
                 'Discount': '{:.2%}',
                 'Profit_Margin': '{:.2f}%'
-            }).background_gradient(cmap='RdYlGn', subset=['Profit_Margin']))
+            }).background_gradient(cmap='Greens', subset=['Profit'])
+        )
 
-    def analyze_regional_performance(self):
-        """Analyze regional revenue leakages"""
-        st.subheader("🌍 Regional Performance Analysis")
+    with col2:
+        st.markdown("#### ⚠️ Bottom Performing Categories")
+        bottom_cats = cat_performance.nsmallest(5, 'Profit')
+        st.dataframe(
+            bottom_cats.style.format({
+                'Sales': '${:,.2f}',
+                'Profit': '${:,.2f}',
+                'Discount': '{:.2%}',
+                'Profit_Margin': '{:.2f}%'
+            }).background_gradient(cmap='Reds', subset=['Profit'])
+        )
 
-        if 'Region' not in self.data.columns and 'State' not in self.data.columns:
-            st.warning("No regional data available")
-            return
+    # Sub-category analysis
+    if 'Sub Category' in analyzer.df.columns:
+        st.markdown("#### Sub-Category Deep Dive")
 
-        region_col = 'Region' if 'Region' in self.data.columns else 'State'
-
-        # Regional performance metrics
-        regional_metrics = self.data.groupby(region_col).agg({
+        subcat_performance = analyzer.df.groupby('Sub Category').agg({
             'Sales': 'sum',
             'Profit': 'sum',
-            'Discount': 'mean'
-        })
+            'Discount': 'mean' if 'Discount' in analyzer.df.columns else lambda x: 0
+        }).sort_values('Profit')
 
-        regional_metrics['Profit_Margin'] = (regional_metrics['Profit'] / regional_metrics['Sales'] * 100)
-        regional_metrics = regional_metrics.sort_values('Profit', ascending=False)
+        subcat_performance['Profit_Margin'] = np.where(
+            subcat_performance['Sales'] > 0,
+            (subcat_performance['Profit'] / subcat_performance['Sales']) * 100,
+            0
+        )
 
-        # Visualize regional performance
-        col1, col2 = st.columns(2)
+        # Filter
+        filter_option = st.radio("Show:", ["All", "Profitable Only", "Loss-Making Only"])
 
-        with col1:
-            fig = px.bar(regional_metrics.reset_index(),
-                        x=region_col, y='Sales',
-                        title=f'Sales by {region_col}',
-                        color='Profit_Margin',
-                        color_continuous_scale='RdYlGn')
-            st.plotly_chart(fig, use_container_width=True)
+        if filter_option == "Profitable Only":
+            subcat_display = subcat_performance[subcat_performance['Profit'] > 0]
+        elif filter_option == "Loss-Making Only":
+            subcat_display = subcat_performance[subcat_performance['Profit'] < 0]
+        else:
+            subcat_display = subcat_performance
 
-        with col2:
-            fig = px.pie(regional_metrics.reset_index(),
-                        values='Profit', names=region_col,
-                        title=f'Profit Distribution by {region_col}')
-            st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(
+            subcat_display.style.format({
+                'Sales': '${:,.2f}',
+                'Profit': '${:,.2f}',
+                'Discount': '{:.2%}',
+                'Profit_Margin': '{:.2f}%'
+            }).background_gradient(cmap='RdYlGn', subset=['Profit_Margin'])
+        )
 
-        # Regional leakage analysis
-        st.markdown(f"#### {region_col} Performance Table")
-        st.dataframe(regional_metrics.style.format({
+
+def _render_regional_analysis(analyzer: RevenueLeakageAnalyzer) -> None:
+    """Render regional performance analysis tab."""
+    st.subheader("🌍 Regional Performance Analysis")
+
+    region_col = None
+    if 'Region' in analyzer.df.columns:
+        region_col = 'Region'
+    elif 'State' in analyzer.df.columns:
+        region_col = 'State'
+
+    if not region_col:
+        st.warning("⚠️ No regional data available")
+        return
+
+    # Regional metrics
+    regional_metrics = analyzer.df.groupby(region_col).agg({
+        'Sales': 'sum',
+        'Profit': 'sum',
+        'Discount': 'mean' if 'Discount' in analyzer.df.columns else lambda x: 0
+    })
+
+    regional_metrics['Profit_Margin'] = np.where(
+        regional_metrics['Sales'] > 0,
+        (regional_metrics['Profit'] / regional_metrics['Sales']) * 100,
+        0
+    )
+    regional_metrics = regional_metrics.sort_values('Profit', ascending=False)
+
+    # Visualizations
+    col1, col2 = st.columns(2)
+
+    with col1:
+        fig = px.bar(
+            regional_metrics.reset_index(),
+            x=region_col,
+            y='Sales',
+            title=f'Sales by {region_col}',
+            color='Profit_Margin',
+            color_continuous_scale='RdYlGn'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        fig = px.pie(
+            regional_metrics.reset_index(),
+            values='Profit',
+            names=region_col,
+            title=f'Profit Distribution by {region_col}'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Table
+    st.markdown(f"#### {region_col} Performance Table")
+    st.dataframe(
+        regional_metrics.style.format({
             'Sales': '${:,.2f}',
             'Profit': '${:,.2f}',
             'Discount': '{:.2%}',
             'Profit_Margin': '{:.2f}%'
-        }).background_gradient(cmap='RdYlGn', subset=['Profit_Margin']))
+        }).background_gradient(cmap='RdYlGn', subset=['Profit_Margin'])
+    )
 
-        # Identify problem regions
-        problem_regions = regional_metrics[regional_metrics['Profit_Margin'] < regional_metrics['Profit_Margin'].mean()]
+    # Problem regions
+    avg_margin = regional_metrics['Profit_Margin'].mean()
+    problem_regions = regional_metrics[regional_metrics['Profit_Margin'] < avg_margin]
 
-        if len(problem_regions) > 0:
-            st.warning(f"⚠️ {len(problem_regions)} regions performing below average profit margin")
-            st.dataframe(problem_regions.style.format({
+    if len(problem_regions) > 0:
+        st.warning(
+            f"⚠️ {len(problem_regions)} regions performing below "
+            f"average profit margin ({avg_margin:.2f}%)"
+        )
+        st.dataframe(
+            problem_regions.style.format({
                 'Sales': '${:,.2f}',
                 'Profit': '${:,.2f}',
                 'Discount': '{:.2%}',
                 'Profit_Margin': '{:.2f}%'
-            }))
+            })
+        )
 
-    def forecast_revenue_leakage(self):
-        """Forecast future revenue leakage using ML models"""
-        st.subheader("🔮 Revenue Leakage Forecasting")
 
-        # Check for time-based data
-        date_col = None
-        for col in self.data.columns:
-            if 'date' in col.lower() and pd.api.types.is_datetime64_any_dtype(self.data[col]):
-                date_col = col
-                break
+def _render_forecasting(
+    analyzer: RevenueLeakageAnalyzer,
+    llm_gen: LLMInsightGenerator,
+    forecast_periods: int
+) -> None:
+    """Render forecasting analysis tab."""
+    st.subheader("🔮 Revenue Leakage Forecasting")
 
-        if not date_col:
-            st.warning("No date column found for time series forecasting")
-            return
+    if not analyzer.date_column:
+        st.warning("⚠️ No date column found for time series forecasting")
+        return
 
-        # Prepare time series data
-        ts_data = self.data.sort_values(date_col).copy()
-        ts_data['Year_Month'] = ts_data[date_col].dt.to_period('M')
+    try:
+        # Generate forecast
+        with st.spinner("Training forecasting model..."):
+            forecast_df, metrics = analyzer.forecast_leakage(forecast_periods)
 
-        monthly_leakage = ts_data.groupby('Year_Month').agg({
-            'Revenue_Lost_to_Discount': 'sum',
-            'Profit': lambda x: abs(x[x < 0].sum()) if (x < 0).any() else 0,
-            'Sales': 'sum'
-        })
-
-        monthly_leakage.columns = ['Discount_Leakage', 'Negative_Profit_Leakage', 'Sales']
-        monthly_leakage['Total_Leakage'] = monthly_leakage['Discount_Leakage'] + monthly_leakage['Negative_Profit_Leakage']
-        monthly_leakage['Leakage_Rate'] = (monthly_leakage['Total_Leakage'] / monthly_leakage['Sales'] * 100)
-        monthly_leakage.index = monthly_leakage.index.to_timestamp()
-
-        if len(monthly_leakage) < 3:
-            st.warning("Insufficient historical data for forecasting")
-            return
-
-        # Feature engineering for ML model
-        monthly_leakage['Month'] = monthly_leakage.index.month
-        monthly_leakage['Month_Num'] = range(len(monthly_leakage))
-
-        # Train ML model
-        features = ['Month', 'Month_Num']
-        X = monthly_leakage[features]
-        y = monthly_leakage['Total_Leakage']
-
-        # Split data
-        split_point = int(len(X) * 0.8)
-        X_train, X_test = X[:split_point], X[split_point:]
-        y_train, y_test = y[:split_point], y[split_point:]
-
-        # Train model
-        model = GradientBoostingRegressor(n_estimators=100, random_state=42)
-        model.fit(X_train, y_train)
-
-        # Make predictions
-        y_pred = model.predict(X_test)
-
-        # Forecast future periods
-        forecast_periods = st.slider("Forecast periods (months)", 1, 12, 6)
-
-        last_month_num = monthly_leakage['Month_Num'].max()
-        last_date = monthly_leakage.index.max()
-
-        future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1),
-                                     periods=forecast_periods, freq='MS')
-
-        future_features = pd.DataFrame({
-            'Month': [d.month for d in future_dates],
-            'Month_Num': range(last_month_num + 1, last_month_num + 1 + forecast_periods)
-        })
-
-        future_predictions = model.predict(future_features)
-
-        # Visualize forecast
+        # Visualize
         fig = go.Figure()
 
-        # Historical data
-        fig.add_trace(go.Scatter(x=monthly_leakage.index, y=monthly_leakage['Total_Leakage'],
-                               mode='lines+markers', name='Historical Leakage',
-                               line=dict(color='#ff6b6b', width=2)))
+        # Historical
+        historical = forecast_df.dropna(subset=['Historical_Leakage'])
+        fig.add_trace(go.Scatter(
+            x=historical['Date'],
+            y=historical['Historical_Leakage'],
+            mode='lines+markers',
+            name='Historical Leakage',
+            line=dict(color='#ff6b6b', width=2)
+        ))
 
-        # Predictions
-        fig.add_trace(go.Scatter(x=future_dates, y=future_predictions,
-                               mode='lines+markers', name='Forecasted Leakage',
-                               line=dict(color='#ffd93d', width=2, dash='dash')))
+        # Forecast
+        forecast = forecast_df.dropna(subset=['Forecasted_Leakage'])
+        fig.add_trace(go.Scatter(
+            x=forecast['Date'],
+            y=forecast['Forecasted_Leakage'],
+            mode='lines+markers',
+            name='Forecasted Leakage',
+            line=dict(color='#ffd93d', width=2, dash='dash')
+        ))
 
-        fig.update_layout(title='Revenue Leakage Forecast',
-                         xaxis_title='Date',
-                         yaxis_title='Total Leakage ($)',
-                         hovermode='x unified')
+        fig.update_layout(
+            title='Revenue Leakage Forecast',
+            xaxis_title='Date',
+            yaxis_title='Total Leakage ($)',
+            hovermode='x unified'
+        )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Display forecast table
-        st.markdown("#### Forecast Details")
-        forecast_df = pd.DataFrame({
-            'Period': future_dates.strftime('%Y-%m'),
-            'Forecasted Leakage': future_predictions
-        })
-
+        # Metrics
         col1, col2 = st.columns(2)
 
         with col1:
-            st.dataframe(forecast_df.style.format({
-                'Forecasted Leakage': '${:,.2f}'
-            }))
+            st.markdown("#### Forecast Summary")
+            st.metric(
+                "Total Forecasted Leakage",
+                f"${metrics['total_forecasted_leakage']:,.2f}"
+            )
+            st.metric(
+                "Avg Monthly Forecast",
+                f"${metrics['avg_monthly_forecast']:,.2f}"
+            )
+            st.metric(
+                "Historical Avg",
+                f"${metrics['historical_avg']:,.2f}"
+            )
 
         with col2:
-            total_forecast_leakage = future_predictions.sum()
-            avg_monthly_leakage = future_predictions.mean()
+            st.markdown("#### Model Performance")
+            if 'mae' in metrics:
+                st.metric("MAE", f"${metrics['mae']:,.2f}")
+            if 'rmse' in metrics:
+                st.metric("RMSE", f"${metrics['rmse']:,.2f}")
+            if 'mape' in metrics:
+                st.metric("MAPE", f"{metrics['mape']:.2f}%")
 
-            st.metric("Total Forecasted Leakage", f"${total_forecast_leakage:,.2f}")
-            st.metric("Avg Monthly Leakage", f"${avg_monthly_leakage:,.2f}")
+        # Forecast table
+        st.markdown("#### Detailed Forecast")
+        forecast_only = forecast_df.dropna(subset=['Forecasted_Leakage'])
+        st.dataframe(
+            forecast_only[['Date', 'Forecasted_Leakage']].style.format({
+                'Date': lambda x: x.strftime('%Y-%m'),
+                'Forecasted_Leakage': '${:,.2f}'
+            })
+        )
 
-            # Model performance
-            if len(y_test) > 0:
-                mae = mean_absolute_error(y_test, y_pred)
-                rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-                st.metric("Model MAE", f"${mae:,.2f}")
-                st.metric("Model RMSE", f"${rmse:,.2f}")
-
-        # AI insights on forecast
+        # AI insights
         st.markdown("#### 🤖 AI-Generated Forecast Insights")
-        forecast_prompt = f"""
-        Analyze this revenue leakage forecast:
-
-        Historical average monthly leakage: ${monthly_leakage['Total_Leakage'].mean():,.2f}
-        Forecasted total leakage ({forecast_periods} months): ${total_forecast_leakage:,.2f}
-        Forecasted average monthly leakage: ${avg_monthly_leakage:,.2f}
-
-        Trend: {"increasing" if future_predictions[-1] > monthly_leakage['Total_Leakage'].mean() else "decreasing"}
-
-        Provide:
-        1. Analysis of the forecast trend
-        2. Potential business impact
-        3. Preventive action recommendations
-        """
-
         with st.spinner("Generating forecast insights..."):
-            insights = self.llm.conversational_response([{'sender': 'user', 'text': forecast_prompt}])['text']
+            insights = llm_gen.generate_forecast_insights(metrics)
         st.write(insights)
 
-    def detect_anomalies(self):
-        """Detect anomalous transactions that indicate revenue leakage"""
-        st.subheader("📈 Anomaly Detection for Revenue Leakage")
+    except ValueError as e:
+        st.error(f"❌ Forecasting error: {str(e)}")
+    except Exception as e:
+        st.error(f"❌ Unexpected error: {str(e)}")
 
-        # Prepare features for anomaly detection
-        numeric_cols = self.data.select_dtypes(include=[np.number]).columns.tolist()
 
-        # Select relevant features
-        anomaly_features = []
-        for col in ['Sales', 'Profit', 'Discount', 'Profit_Margin']:
-            if col in numeric_cols:
-                anomaly_features.append(col)
+def _render_anomaly_detection(
+    analyzer: RevenueLeakageAnalyzer,
+    contamination: float
+) -> None:
+    """Render anomaly detection tab."""
+    st.subheader("📈 Anomaly Detection for Revenue Leakage")
 
-        if len(anomaly_features) < 2:
-            st.warning("Insufficient numeric features for anomaly detection")
-            return
+    try:
+        with st.spinner("Detecting anomalies..."):
+            anomalies_df, summary = analyzer.detect_anomalies(contamination)
 
-        # Prepare data
-        X = self.data[anomaly_features].dropna()
+        # Summary metrics
+        col1, col2, col3 = st.columns(3)
 
-        # Train Isolation Forest
-        contamination = st.slider("Anomaly Sensitivity (% of outliers)", 1, 20, 5) / 100
+        with col1:
+            st.metric("Anomalous Transactions", summary['anomaly_count'])
+            st.metric(
+                "Anomaly Rate",
+                f"{summary['anomaly_percentage']:.2f}%"
+            )
 
-        iso_forest = IsolationForest(contamination=contamination, random_state=42)
-        anomaly_predictions = iso_forest.fit_predict(X)
+        with col2:
+            st.metric(
+                "Sales at Risk",
+                f"${summary['total_sales_at_risk']:,.2f}"
+            )
+            st.metric(
+                "Leakage in Anomalies",
+                f"${summary['total_leakage_in_anomalies']:,.2f}"
+            )
 
-        # Add predictions to data
-        anomalies_df = self.data.loc[X.index].copy()
-        anomalies_df['Anomaly'] = anomaly_predictions
-        anomalies_df['Anomaly_Label'] = anomalies_df['Anomaly'].map({1: 'Normal', -1: 'Anomaly'})
+        with col3:
+            st.metric(
+                "Avg Anomaly Score",
+                f"{summary['avg_anomaly_score']:.2f}"
+            )
 
-        # Count anomalies
-        num_anomalies = (anomaly_predictions == -1).sum()
-        anomaly_data = anomalies_df[anomalies_df['Anomaly'] == -1]
+        # Visualization
+        if 'Sales' in anomalies_df.columns and 'Profit' in anomalies_df.columns:
+            # Sample for performance
+            sample_size = min(2000, len(analyzer.df))
+            plot_df = analyzer.df.sample(sample_size, random_state=42).copy()
+            plot_df['Type'] = 'Normal'
 
-        st.metric("Anomalous Transactions Detected", num_anomalies)
-        st.metric("Potential Revenue at Risk",
-                 f"${anomaly_data['Sales'].sum():,.2f}" if len(anomaly_data) > 0 else "$0.00")
+            # Mark anomalies
+            anomaly_indices = set(anomalies_df.index)
+            plot_df.loc[plot_df.index.isin(anomaly_indices), 'Type'] = 'Anomaly'
 
-        # Visualize anomalies
-        if 'Sales' in anomaly_features and 'Profit' in anomaly_features:
-            fig = px.scatter(anomalies_df, x='Sales', y='Profit',
-                           color='Anomaly_Label',
-                           title='Anomaly Detection: Sales vs Profit',
-                           color_discrete_map={'Normal': '#4ecdc4', 'Anomaly': '#ff6b6b'},
-                           hover_data=['Discount'] if 'Discount' in anomalies_df.columns else None)
+            fig = px.scatter(
+                plot_df,
+                x='Sales',
+                y='Profit',
+                color='Type',
+                title='Anomaly Detection: Sales vs Profit',
+                color_discrete_map={'Normal': '#4ecdc4', 'Anomaly': '#ff6b6b'},
+                hover_data=['Discount'] if 'Discount' in plot_df.columns else None
+            )
             st.plotly_chart(fig, use_container_width=True)
 
-        # Show anomaly details
-        if len(anomaly_data) > 0:
+        # Anomaly details
+        if len(anomalies_df) > 0:
             st.markdown("#### Anomalous Transactions Details")
 
-            display_cols = ['Sales', 'Profit', 'Discount', 'Profit_Margin']
-            if 'Category' in anomaly_data.columns:
+            display_cols = ['Sales', 'Profit', 'Profit_Margin',
+                          'Total_Leakage', 'Anomaly_Score', 'Flags']
+
+            if 'Category' in anomalies_df.columns:
                 display_cols.insert(0, 'Category')
-            if 'Sub Category' in anomaly_data.columns:
-                display_cols.insert(1, 'Sub Category')
+            if 'Discount' in anomalies_df.columns:
+                display_cols.insert(-2, 'Discount')
 
-            display_cols = [col for col in display_cols if col in anomaly_data.columns]
+            display_cols = [col for col in display_cols if col in anomalies_df.columns]
 
-            st.dataframe(anomaly_data[display_cols].head(20).style.format({
-                col: '${:,.2f}' for col in display_cols if col in ['Sales', 'Profit']
-            }).format({
-                col: '{:.2%}' for col in display_cols if col in ['Discount']
-            }).format({
-                col: '{:.2f}%' for col in display_cols if col in ['Profit_Margin']
-            }))
+            # Show top 50
+            display_df = anomalies_df[display_cols].head(50)
 
-            # Download anomalies
-            csv = anomaly_data.to_csv(index=False)
+            # Format
+            format_dict = {}
+            for col in display_cols:
+                if col in ['Sales', 'Profit', 'Total_Leakage']:
+                    format_dict[col] = '${:,.2f}'
+                elif col == 'Discount':
+                    format_dict[col] = '{:.2%}'
+                elif col in ['Profit_Margin', 'Anomaly_Score']:
+                    format_dict[col] = '{:.2f}'
+
+            st.dataframe(display_df.style.format(format_dict))
+
+            # Download
+            csv = anomalies_df.to_csv(index=False)
             st.download_button(
-                label="Download Anomalous Transactions",
+                label="📥 Download All Anomalous Transactions (CSV)",
                 data=csv,
                 file_name="revenue_leakage_anomalies.csv",
                 mime="text/csv"
             )
+        else:
+            st.info("✅ No significant anomalies detected")
 
-    def generate_recommendations(self):
-        """Generate AI-powered recommendations to reduce revenue leakage"""
-        st.subheader("📋 AI-Powered Recommendations to Reduce Revenue Leakage")
+    except ValueError as e:
+        st.error(f"❌ Anomaly detection error: {str(e)}")
+    except Exception as e:
+        st.error(f"❌ Unexpected error: {str(e)}")
 
-        # Compile key findings
-        total_sales = self.data['Sales'].sum() if 'Sales' in self.data.columns else 0
-        total_profit = self.data['Profit'].sum() if 'Profit' in self.data.columns else 0
-        avg_discount = self.data['Discount'].mean() * 100 if 'Discount' in self.data.columns else 0
 
-        revenue_lost_discount = self.data['Revenue_Lost_to_Discount'].sum() if 'Revenue_Lost_to_Discount' in self.data.columns else 0
-        negative_profit_trans = len(self.data[self.data['Profit'] < 0]) if 'Profit' in self.data.columns else 0
+def _render_recommendations(
+    analyzer: RevenueLeakageAnalyzer,
+    llm_gen: LLMInsightGenerator
+) -> None:
+    """Render recommendations tab."""
+    st.subheader("📋 AI-Powered Recommendations to Reduce Revenue Leakage")
 
-        # Category analysis
-        category_insights = ""
-        if 'Category' in self.data.columns:
-            cat_profit = self.data.groupby('Category')['Profit'].sum().sort_values()
-            worst_categories = cat_profit.head(3).to_string()
-            best_categories = cat_profit.tail(3).to_string()
-            category_insights = f"\nWorst performing categories:\n{worst_categories}\n\nBest performing categories:\n{best_categories}"
+    # Compile summary
+    metrics = analyzer.compute_leakage_metrics()
 
-        # Generate comprehensive recommendations
-        recommendation_prompt = f"""
-        As a business consultant, provide detailed, actionable recommendations to reduce revenue leakage based on this analysis:
+    # Get worst performers
+    top_categories = None
+    if 'Category' in analyzer.df.columns:
+        cat_profit = analyzer.df.groupby('Category')['Profit'].sum().sort_values()
+        top_categories = cat_profit.head(3).index.tolist()
 
-        **Financial Overview:**
-        - Total Sales: ${total_sales:,.2f}
-        - Total Profit: ${total_profit:,.2f}
-        - Average Discount Rate: {avg_discount:.2f}%
-        - Revenue Lost to Discounts: ${revenue_lost_discount:,.2f}
-        - Number of Negative Profit Transactions: {negative_profit_trans}
+    top_regions = None
+    region_col = 'Region' if 'Region' in analyzer.df.columns else (
+        'State' if 'State' in analyzer.df.columns else None
+    )
+    if region_col:
+        region_profit = analyzer.df.groupby(region_col)['Profit'].sum().sort_values()
+        top_regions = region_profit.head(3).index.tolist()
 
-        **Category Performance:**
-        {category_insights}
-
-        Please provide:
-
-        1. **Immediate Actions** (0-30 days):
-           - Quick wins to stop revenue leakage
-           - Emergency measures for loss-making products/categories
-
-        2. **Short-term Strategy** (1-3 months):
-           - Pricing optimization recommendations
-           - Discount policy improvements
-           - Product mix optimization
-
-        3. **Long-term Strategy** (3-12 months):
-           - Strategic changes to business model
-           - Category/product portfolio restructuring
-           - Customer segment optimization
-
-        4. **Specific Metrics to Track**:
-           - KPIs to monitor improvement
-           - Target values for each metric
-
-        5. **Expected Impact**:
-           - Estimated revenue recovery potential
-           - Timeline for results
-
-        Be specific, actionable, and quantify recommendations where possible.
-        """
-
-        with st.spinner("Generating comprehensive recommendations..."):
-            recommendations = self.llm.conversational_response([{'sender': 'user', 'text': recommendation_prompt}])['text']
-
-        st.write(recommendations)
-
-        # Export report
-        st.markdown("---")
-        st.markdown("#### 📥 Export Complete Analysis Report")
-
-        if st.button("Generate PDF Report"):
-            st.info("PDF report generation feature - implementation requires additional PDF library")
-            # This would require reportlab or similar library
-
-        # Create summary report as CSV
-        summary_data = {
-            'Metric': [
-                'Total Sales',
-                'Total Profit',
-                'Average Discount',
-                'Revenue Lost to Discounts',
-                'Negative Profit Transactions',
-                'Total Revenue Leakage'
-            ],
-            'Value': [
-                f"${total_sales:,.2f}",
-                f"${total_profit:,.2f}",
-                f"{avg_discount:.2f}%",
-                f"${revenue_lost_discount:,.2f}",
-                negative_profit_trans,
-                f"${revenue_lost_discount + abs(self.data[self.data['Profit'] < 0]['Profit'].sum()):,.2f}"
-            ]
-        }
-
-        summary_df = pd.DataFrame(summary_data)
-        csv = summary_df.to_csv(index=False)
-
-        st.download_button(
-            label="Download Summary Report (CSV)",
-            data=csv,
-            file_name="revenue_leakage_summary.csv",
-            mime="text/csv"
+    # Generate recommendations
+    with st.spinner("Generating comprehensive recommendations..."):
+        recommendations = llm_gen.generate_recommendations(
+            metrics,
+            top_categories,
+            top_regions
         )
+
+    st.write(recommendations)
+
+    # Export options
+    st.markdown("---")
+    st.markdown("#### 📥 Export Analysis Report")
+
+    # Summary CSV
+    summary_data = {
+        'Metric': [
+            'Total Sales',
+            'Total Profit',
+            'Average Profit Margin',
+            'Total Discount Leakage',
+            'Total Margin Leakage',
+            'Total Revenue Leakage',
+            'Average Leakage Rate',
+            'Negative Profit Transactions'
+        ],
+        'Value': [
+            f"${metrics['total_sales']:,.2f}",
+            f"${metrics['total_profit']:,.2f}",
+            f"{metrics['avg_profit_margin']:.2f}%",
+            f"${metrics['total_discount_leakage']:,.2f}",
+            f"${metrics['total_margin_leakage']:,.2f}",
+            f"${metrics['total_leakage']:,.2f}",
+            f"{metrics['avg_leakage_rate']:.2f}%",
+            str(metrics['negative_profit_count'])
+        ]
+    }
+
+    summary_df = pd.DataFrame(summary_data)
+    csv = summary_df.to_csv(index=False)
+
+    st.download_button(
+        label="📥 Download Summary Report (CSV)",
+        data=csv,
+        file_name="revenue_leakage_summary.csv",
+        mime="text/csv"
+    )
+
+
+# ============================================================================
+# Legacy Compatibility
+# ============================================================================
+
+class RevenueLeakageDetector:
+    """
+    Legacy compatibility wrapper.
+
+    Maintains backward compatibility with old API while using new architecture.
+    """
+
+    def __init__(self, data: pd.DataFrame, llm: Any):
+        """Initialize with data and LLM client."""
+        self.data = data
+        self.llm = llm
+
+    def detect_leakages(self) -> None:
+        """Run the revenue leakage application."""
+        run_revenue_leakage_app(self.data, self.llm)
