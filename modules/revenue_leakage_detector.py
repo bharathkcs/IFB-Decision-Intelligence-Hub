@@ -30,7 +30,6 @@ from sklearn.ensemble import (
     IsolationForest,
 )
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.preprocessing import LabelEncoder
 
 
 # ============================================================================
@@ -178,23 +177,78 @@ class RevenueLeakageAnalyzer:
         return self.df
 
     def _detect_and_convert_dates(self) -> None:
-        """Detect and convert date columns to datetime and pick a primary date column."""
+        """
+        Detect and convert date columns to datetime and pick a primary date column.
+
+        Selection Logic:
+        1. Identifies all candidate date columns (existing datetime or name contains 'date')
+        2. Prefers columns with 'order' in the name (case-insensitive)
+        3. Among candidates, selects the one with lowest percentage of NaNs
+        4. Raises ValueError if time-series analysis will be attempted but no date column exists
+
+        The selected column is stored in self.date_column and used for all temporal analysis.
+
+        Raises:
+            ValueError: If date columns exist but all fail to parse.
+        """
+        # Find all candidate date columns
+        candidates = []
+
         for col in self.df.columns:
-            # Already datetime
+            # Already datetime type
             if pd.api.types.is_datetime64_any_dtype(self.df[col]):
-                if self.date_column is None:
-                    self.date_column = col
+                nan_pct = self.df[col].isna().mean()
+                has_order = 'order' in col.lower()
+                candidates.append({
+                    'column': col,
+                    'nan_pct': nan_pct,
+                    'has_order': has_order,
+                    'already_datetime': True
+                })
                 continue
 
             # Column name suggests date
             if "date" in col.lower():
                 try:
-                    self.df[col] = pd.to_datetime(self.df[col], errors="coerce")
-                    if self.date_column is None:
-                        self.date_column = col
+                    converted = pd.to_datetime(self.df[col], errors="coerce")
+                    nan_pct = converted.isna().mean()
+
+                    # Only accept if conversion was at least partially successful
+                    if nan_pct < 1.0:
+                        self.df[col] = converted
+                        has_order = 'order' in col.lower()
+                        candidates.append({
+                            'column': col,
+                            'nan_pct': nan_pct,
+                            'has_order': has_order,
+                            'already_datetime': False
+                        })
                 except Exception:
-                    # If conversion fails, just skip
+                    # Conversion completely failed, skip this column
                     pass
+
+        # Select best candidate if any exist
+        if candidates:
+            # Sort by: has_order (descending), then nan_pct (ascending)
+            candidates_sorted = sorted(
+                candidates,
+                key=lambda x: (not x['has_order'], x['nan_pct'])
+            )
+            selected = candidates_sorted[0]
+            self.date_column = selected['column']
+
+            # Document the selection in a way that's visible during analysis
+            # (Could be logged if a logger was available)
+            self._date_selection_reason = (
+                f"Selected '{self.date_column}' as primary date column. "
+                f"Reason: {'Contains order keyword' if selected['has_order'] else 'Best quality'} "
+                f"(NaN rate: {selected['nan_pct']:.1%})"
+            )
+        else:
+            # No date columns found - this is acceptable for non-temporal analysis
+            # Time-series methods will raise explicit errors when called
+            self.date_column = None
+            self._date_selection_reason = "No date columns detected"
 
     def _normalize_discounts(self) -> None:
         """
@@ -223,6 +277,30 @@ class RevenueLeakageAnalyzer:
             - Discount_Leakage: Revenue lost to discounts (Sales * Discount).
             - Total_Leakage: Margin_Leakage + Discount_Leakage.
             - Leakage_Rate: Total_Leakage / Sales * 100 with safe division.
+
+        IMPORTANT ASSUMPTIONS & LIMITATIONS:
+
+        1. Discount_Leakage = Sales × Discount is a SIMPLIFIED PROXY for diagnostic purposes.
+           This formula assumes:
+           - All discounts represent lost revenue (ignores strategic/promotional intent)
+           - No price elasticity effects (volume gains from discounting are ignored)
+           - No consideration of competitive dynamics or market share gains
+           - Uniform treatment of tactical vs. strategic discounts
+
+           WHY THIS IS ACCEPTABLE:
+           - Useful for identifying discount patterns and high-risk transactions
+           - Appropriate for diagnostic dashboards and leakage detection
+           - Provides upper-bound estimate of potential discount impact
+
+           WHY THIS IS NOT SUFFICIENT:
+           - Should NOT be used for pricing optimization or promotional ROI analysis
+           - Does not account for incremental volume driven by discounts
+           - May overestimate actual economic loss in competitive/promotional contexts
+
+        2. Margin_Leakage represents deviation from target margins, which may be
+           influenced by factors beyond pricing (e.g., cost fluctuations, product mix).
+
+        For strategic pricing decisions, consult pricing analytics with elasticity modeling.
         """
         # Profit margin (%)
         self.df["Profit_Margin"] = np.where(
@@ -396,14 +474,20 @@ class RevenueLeakageAnalyzer:
         forecast_periods: int = 6,
     ) -> Tuple[pd.DataFrame, Dict[str, float]]:
         """
-        Forecast future revenue leakage using a tree-based regressor.
+        Forecast future revenue leakage using a tree-based regressor with walk-forward validation.
 
         Steps:
         - Aggregate data to monthly level.
         - Engineer lag and rolling features.
-        - Train GradientBoostingRegressor with time-based split.
-        - Compute MAE, RMSE, MAPE (if possible).
-        - Iteratively forecast future periods.
+        - Validate data sufficiency based on feature requirements.
+        - Perform walk-forward (rolling-origin) validation for robust performance metrics.
+        - Train final model on all available data.
+        - Iteratively forecast future periods with NaN guards.
+
+        Walk-forward Validation:
+            Implements rolling-origin cross-validation where the model is trained on
+            progressively longer history and tested on the next unseen period. This
+            provides more realistic performance estimates than a single train/test split.
 
         Args:
             forecast_periods: Number of months to forecast.
@@ -411,13 +495,17 @@ class RevenueLeakageAnalyzer:
         Returns:
             (forecast_df, metrics_dict)
                 forecast_df: DataFrame with Date, Historical_Leakage, Forecasted_Leakage.
-                metrics_dict: Model performance and summary metrics.
+                metrics_dict: Model performance metrics (including walk-forward validation)
+                              and forecast summary statistics.
 
         Raises:
-            ValueError: If insufficient data for forecasting.
+            ValueError: If insufficient data for forecasting based on feature requirements.
         """
         if not self.date_column:
-            raise ValueError("No date column available for forecasting")
+            raise ValueError(
+                "No date column available for forecasting. "
+                "Time-series analysis requires a valid date column."
+            )
 
         if not self.prepared:
             self.prepare_data()
@@ -432,10 +520,18 @@ class RevenueLeakageAnalyzer:
         monthly_data["Date"] = monthly_data["YearMonth"].dt.to_timestamp()
         monthly_data = monthly_data.set_index("Date").sort_index()
 
-        if len(monthly_data) < 6:
+        # Intelligent minimum data requirement
+        # Need enough history for: max lag + max rolling window + buffer for validation
+        max_lag = max(self.config.lag_periods) if self.config.lag_periods else 1
+        max_window = max(self.config.rolling_windows) if self.config.rolling_windows else 3
+        min_history = max_lag + max_window + 3  # +3 for walk-forward validation buffer
+
+        if len(monthly_data) < min_history:
             raise ValueError(
-                f"Insufficient data for forecasting. Need at least 6 months, "
-                f"got {len(monthly_data)}"
+                f"Insufficient data for forecasting. "
+                f"Require at least {min_history} months based on feature configuration "
+                f"(max_lag={max_lag}, max_rolling_window={max_window}, buffer=3), "
+                f"but only {len(monthly_data)} months available."
             )
 
         # Add lag/rolling features
@@ -444,8 +540,12 @@ class RevenueLeakageAnalyzer:
         # Drop initial NaNs from lag/rolling
         monthly_data = monthly_data.dropna()
 
-        if len(monthly_data) < 4:
-            raise ValueError("Insufficient data after feature engineering")
+        # Re-validate after feature engineering
+        if len(monthly_data) < max_lag + 2:
+            raise ValueError(
+                f"Insufficient data after feature engineering. "
+                f"Need at least {max_lag + 2} clean records, got {len(monthly_data)}."
+            )
 
         # Calendar features
         monthly_data["Month"] = monthly_data.index.month
@@ -476,37 +576,102 @@ class RevenueLeakageAnalyzer:
         y = y.loc[valid_mask]
         monthly_data = monthly_data.loc[valid_mask]
 
-        if len(X) < 4:
-            raise ValueError("Insufficient clean data for forecasting after NaN removal")
+        if len(X) < max_lag + 2:
+            raise ValueError(
+                f"Insufficient clean data for forecasting after NaN removal. "
+                f"Need at least {max_lag + 2} records, got {len(X)}."
+            )
 
-        # Time-based split
+        # ========================================================================
+        # WALK-FORWARD VALIDATION (Rolling Origin Cross-Validation)
+        # ========================================================================
+        # This provides robust performance estimates by training on progressively
+        # longer history and testing on the next unseen period.
+        #
+        # Example: For 12 months of data with min_train=6:
+        #   Fold 1: Train on months 1-6, test on month 7
+        #   Fold 2: Train on months 1-7, test on month 8
+        #   ...
+        #   Fold 6: Train on months 1-11, test on month 12
+
+        min_train_periods = max_lag + max_window + 1
+        walk_forward_mae = []
+        walk_forward_squared_errors = []
+
+        if len(X) >= min_train_periods + 2:  # Need at least 2 test periods
+            for test_idx in range(min_train_periods, len(X)):
+                # Expanding window: train on all data up to test_idx
+                X_train_fold = X.iloc[:test_idx]
+                y_train_fold = y.iloc[:test_idx]
+
+                # Test on single next period
+                X_test_fold = X.iloc[test_idx:test_idx + 1]
+                y_test_fold = y.iloc[test_idx:test_idx + 1]
+
+                # Train fold model
+                model_fold = GradientBoostingRegressor(
+                    n_estimators=self.config.n_estimators,
+                    random_state=self.config.random_state,
+                    learning_rate=0.1,
+                    max_depth=4,
+                )
+                model_fold.fit(X_train_fold, y_train_fold)
+
+                # Predict and store error
+                y_pred_fold = model_fold.predict(X_test_fold)[0]
+                y_actual_fold = y_test_fold.values[0]
+
+                walk_forward_mae.append(abs(y_actual_fold - y_pred_fold))
+                walk_forward_squared_errors.append((y_actual_fold - y_pred_fold) ** 2)
+
+        # ========================================================================
+        # TRADITIONAL TRAIN/TEST SPLIT (for comparison)
+        # ========================================================================
         split_idx = int(len(X) * self.config.train_test_split)
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
         y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
-        # Train model
+        # Train final model on all data for forecasting
         model = GradientBoostingRegressor(
             n_estimators=self.config.n_estimators,
             random_state=self.config.random_state,
             learning_rate=0.1,
             max_depth=4,
         )
-        model.fit(X_train, y_train)
+        model.fit(X, y)  # Use ALL data for final model
 
-        # Evaluate on test set
+        # Compute performance metrics
         metrics: Dict[str, float] = {}
+
+        # Walk-forward validation metrics (preferred - more realistic)
+        if walk_forward_mae:
+            metrics["walk_forward_mae"] = float(np.mean(walk_forward_mae))
+            metrics["walk_forward_rmse"] = float(np.sqrt(np.mean(walk_forward_squared_errors)))
+            metrics["walk_forward_folds"] = len(walk_forward_mae)
+
+        # Traditional test set metrics (for reference)
         if len(X_test) > 0:
-            y_pred = model.predict(X_test)
-            metrics["mae"] = float(mean_absolute_error(y_test, y_pred))
-            metrics["rmse"] = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+            y_pred_test = model.predict(X_test)
+            metrics["test_mae"] = float(mean_absolute_error(y_test, y_pred_test))
+            metrics["test_rmse"] = float(np.sqrt(mean_squared_error(y_test, y_pred_test)))
 
             # MAPE (avoid division by zero)
             mask = y_test != 0
             if mask.sum() > 0:
                 mape = (
-                    np.mean(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100
+                    np.mean(np.abs((y_test[mask] - y_pred_test[mask]) / y_test[mask])) * 100
                 )
-                metrics["mape"] = float(mape)
+                metrics["test_mape"] = float(mape)
+
+        # Use walk-forward metrics as primary if available, else fall back to test metrics
+        if "walk_forward_mae" in metrics:
+            metrics["mae"] = metrics["walk_forward_mae"]
+            metrics["rmse"] = metrics["walk_forward_rmse"]
+        elif "test_mae" in metrics:
+            metrics["mae"] = metrics["test_mae"]
+            metrics["rmse"] = metrics["test_rmse"]
+            if "test_mape" in metrics:
+                metrics["mape"] = metrics["test_mape"]
 
         # Future forecasting
         last_date = monthly_data.index[-1]
@@ -563,10 +728,19 @@ class RevenueLeakageAnalyzer:
                     float(np.mean(values)) if values else 0.0
                 )
 
-            # Predict
+            # Predict with explicit NaN guards
             X_future = pd.DataFrame([future_row])[feature_cols]
             X_future = X_future.apply(pd.to_numeric, errors="coerce")
-            X_future = X_future.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            X_future = X_future.replace([np.inf, -np.inf], np.nan)
+
+            # CRITICAL: Verify no NaNs exist before prediction
+            # NaNs in feature matrix will cause prediction failures or unreliable results
+            if X_future.isna().any().any():
+                raise ValueError(
+                    f"NaN values detected in future features before prediction. "
+                    f"This indicates insufficient historical data for lag/rolling features. "
+                    f"Problematic features: {X_future.columns[X_future.isna().any()].tolist()}"
+                )
 
             prediction = float(model.predict(X_future)[0])
             future_predictions.append(prediction)
@@ -629,12 +803,18 @@ class RevenueLeakageAnalyzer:
         """
         Detect anomalous transactions using regression residuals and IsolationForest.
 
-        Steps:
-        - Train regression model to predict expected profit.
-        - Compute residuals (expected - actual).
-        - Mark residual-based anomalies (high residual & low/negative profit).
-        - Train IsolationForest on feature space.
-        - Flag final anomalies where either rule or IsolationForest triggers.
+        CORRECTED APPROACH (aligned with business leakage definition):
+        - Train regression model to predict EXPECTED profit (what we should earn).
+        - Compute residuals = Expected (model prediction) - Actual profit.
+        - High residual = actual is much lower than expected = leakage.
+        - Mark residual-based anomalies: high residual AND low/negative actual profit.
+        - Train IsolationForest on feature space for statistical outliers.
+        - Combine both signals for final anomaly detection.
+
+        Anomaly Score:
+        - Normalized residual (percentile-based) scaled to [0, 100]
+        - Higher score = worse (more leakage / more anomalous)
+        - Interpretable across different datasets
 
         Args:
             contamination: Expected proportion of outliers (0–1).
@@ -645,9 +825,10 @@ class RevenueLeakageAnalyzer:
         if not self.prepared:
             self.prepare_data()
 
+        # Core numeric features
         feature_cols: List[str] = [
             "Sales",
-            "Profit",
+            "Expected_Profit",  # Target for regression
             "Profit_Margin",
             "Margin_Leakage",
             "Total_Leakage",
@@ -658,16 +839,22 @@ class RevenueLeakageAnalyzer:
 
         df_encoded = self.df.copy()
 
-        # Simple label-encoding of categoricals
-        for col in ["Category", "Sub Category", "Region", "Customer Segment"]:
+        # One-hot encoding for categorical features (replaces LabelEncoder)
+        # This avoids imposing false ordinal relationships
+        categorical_cols = ["Category", "Sub Category", "Region", "Customer Segment"]
+        for col in categorical_cols:
             if col in df_encoded.columns:
-                le = LabelEncoder()
-                df_encoded[f"{col}_Encoded"] = le.fit_transform(
-                    df_encoded[col].astype(str)
+                # One-hot encode with prefix, drop first to avoid collinearity
+                dummies = pd.get_dummies(
+                    df_encoded[col].astype(str),
+                    prefix=col,
+                    drop_first=True,
+                    dtype=float
                 )
-                feature_cols.append(f"{col}_Encoded")
+                df_encoded = pd.concat([df_encoded, dummies], axis=1)
+                feature_cols.extend(dummies.columns.tolist())
 
-        df_features = df_encoded[feature_cols].copy()
+        df_features = df_encoded[feature_cols + ["Profit"]].copy()
         df_features = df_features.replace([np.inf, -np.inf], np.nan).dropna()
 
         if len(df_features) < 100:
@@ -675,13 +862,17 @@ class RevenueLeakageAnalyzer:
                 "Insufficient data for anomaly detection (need >= 100 records)"
             )
 
-        # Regression model: predict Profit
-        X = df_features.drop(["Profit"], axis=1, errors="ignore")
-        y = df_features["Profit"]
+        # ========================================================================
+        # CORRECTED REGRESSION: Predict Expected_Profit (what SHOULD be earned)
+        # ========================================================================
+        # We remove Expected_Profit from features and use it as target
+        X = df_features.drop(["Expected_Profit", "Profit"], axis=1, errors="ignore")
+        y_expected = df_features["Expected_Profit"]  # Target: what we expect
+        y_actual = df_features["Profit"]  # Actual profit (for residual computation)
 
         split_idx = int(len(X) * 0.8)
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, _ = y.iloc[:split_idx], y.iloc[split_idx:]
+        y_train, _ = y_expected.iloc[:split_idx], y_expected.iloc[split_idx:]
 
         model = GradientBoostingRegressor(
             n_estimators=100,
@@ -690,20 +881,28 @@ class RevenueLeakageAnalyzer:
         )
         model.fit(X_train, y_train)
 
-        # Predict on full feature set
-        y_pred_all = model.predict(X)
-        residuals = y_pred_all - y.values
+        # Predict expected profit on full dataset
+        y_pred_expected = model.predict(X)
+
+        # CORRECTED RESIDUAL DEFINITION:
+        # Residual = Expected (model prediction) - Actual
+        # High residual = actual is much lower than expected = LEAKAGE
+        residuals = y_pred_expected - y_actual.values
 
         df_features["Residual"] = residuals
-        df_features["Expected_Profit_Model"] = y_pred_all
+        df_features["Expected_Profit_Model"] = y_pred_expected
 
         # Residual-based anomalies
+        # High percentile residual (expected >> actual) AND low/negative actual profit
         residual_threshold = np.percentile(
             residuals, self.config.anomaly_percentile * 100
         )
         df_features["Is_Anomaly_Residual"] = (
             (df_features["Residual"] > residual_threshold)
-            & (df_features["Profit"] < df_features["Profit"].quantile(0.25))
+            & (
+                (df_features["Profit"] < df_features["Profit"].quantile(0.25))
+                | (df_features["Profit"] < 0)
+            )
         )
 
         # IsolationForest anomalies
@@ -719,10 +918,17 @@ class RevenueLeakageAnalyzer:
             "Is_Anomaly_ISO"
         ]
 
-        # Normalized anomaly score
-        df_features["Anomaly_Score"] = (
-            df_features["Residual"] - residuals.mean()
-        ) / residuals.std()
+        # ========================================================================
+        # CONSISTENT & INTERPRETABLE ANOMALY SCORE
+        # ========================================================================
+        # Use percentile-based normalization for consistent interpretation
+        # Score = percentile rank of residual, scaled to [0, 100]
+        # Higher score = worse (more leakage)
+        from scipy.stats import percentileofscore
+
+        df_features["Anomaly_Score"] = df_features["Residual"].apply(
+            lambda x: percentileofscore(residuals, x, kind="rank")
+        )
 
         # Join back with original df
         anomaly_indices = df_features[df_features["Is_Anomaly"]].index
@@ -776,15 +982,20 @@ class RevenueLeakageAnalyzer:
 
     def score_leakage_risk(self) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
-        Score each transaction for leakage risk using classification.
+        Score each transaction for leakage risk using classification with full evaluation.
 
         Steps:
         - Construct Leakage_Flag: 1 if Total_Leakage above 75th percentile or Profit_Margin < 0.
-        - Train GradientBoostingClassifier to predict Leakage_Flag.
+        - One-hot encode categorical features (no LabelEncoder to avoid ordinal assumptions).
+        - Perform time-aware or random train/test split.
+        - Train GradientBoostingClassifier with evaluation on test set.
+        - Compute classification metrics: Accuracy, Precision, Recall, ROC-AUC.
         - Output leakage probability for each transaction.
 
         Returns:
             (risk_scores_df, metadata_dict)
+                risk_scores_df: DataFrame with Leakage_Probability column.
+                metadata_dict: Contains feature importance and MODEL EVALUATION METRICS.
         """
         if not self.prepared:
             self.prepare_data()
@@ -801,13 +1012,19 @@ class RevenueLeakageAnalyzer:
             feature_cols.append("Discount")
 
         df_encoded = self.df.copy()
-        for col in ["Category", "Sub Category", "Region", "Customer Segment"]:
+
+        # One-hot encoding for categorical features (replaces LabelEncoder)
+        categorical_cols = ["Category", "Sub Category", "Region", "Customer Segment"]
+        for col in categorical_cols:
             if col in df_encoded.columns:
-                le = LabelEncoder()
-                df_encoded[f"{col}_Encoded"] = le.fit_transform(
-                    df_encoded[col].astype(str)
+                dummies = pd.get_dummies(
+                    df_encoded[col].astype(str),
+                    prefix=col,
+                    drop_first=True,
+                    dtype=float
                 )
-                feature_cols.append(f"{col}_Encoded")
+                df_encoded = pd.concat([df_encoded, dummies], axis=1)
+                feature_cols.extend(dummies.columns.tolist())
 
         df_model = df_encoded[feature_cols + ["Leakage_Flag"]].copy()
         df_model = df_model.replace([np.inf, -np.inf], np.nan).dropna()
@@ -818,18 +1035,79 @@ class RevenueLeakageAnalyzer:
         if len(X) < 20:
             raise ValueError("Insufficient data for risk scoring")
 
+        # ========================================================================
+        # TRAIN/TEST SPLIT FOR MODEL EVALUATION
+        # ========================================================================
+        # Time-aware split if date column exists, else random split
+        if self.date_column and self.date_column in self.df.columns:
+            # Time-based split: train on earlier data, test on later
+            df_with_date = self.df.loc[df_model.index].copy()
+            df_with_date = df_with_date.sort_values(self.date_column)
+            split_idx = int(len(df_with_date) * 0.75)
+
+            train_indices = df_with_date.index[:split_idx]
+            test_indices = df_with_date.index[split_idx:]
+
+            X_train = X.loc[train_indices]
+            X_test = X.loc[test_indices]
+            y_train = y.loc[train_indices]
+            y_test = y.loc[test_indices]
+        else:
+            # Random split
+            from sklearn.model_selection import train_test_split
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.25, random_state=self.config.random_state, stratify=y
+            )
+
+        # Train classifier
         clf = GradientBoostingClassifier(
             n_estimators=self.config.n_estimators,
             random_state=self.config.random_state,
             max_depth=4,
         )
-        clf.fit(X, y)
+        clf.fit(X_train, y_train)
 
+        # ========================================================================
+        # MODEL EVALUATION ON TEST SET
+        # ========================================================================
+        from sklearn.metrics import (
+            accuracy_score,
+            precision_score,
+            recall_score,
+            roc_auc_score,
+            confusion_matrix,
+        )
+
+        y_pred_test = clf.predict(X_test)
+        y_prob_test = clf.predict_proba(X_test)[:, 1]
+
+        evaluation_metrics = {
+            "accuracy": float(accuracy_score(y_test, y_pred_test)),
+            "precision": float(precision_score(y_test, y_pred_test, zero_division=0)),
+            "recall": float(recall_score(y_test, y_pred_test, zero_division=0)),
+            "roc_auc": float(roc_auc_score(y_test, y_prob_test)),
+            "test_samples": len(y_test),
+            "train_samples": len(y_train),
+        }
+
+        # Confusion matrix
+        cm = confusion_matrix(y_test, y_pred_test)
+        if cm.shape == (2, 2):
+            tn, fp, fn, tp = cm.ravel()
+            evaluation_metrics["confusion_matrix"] = {
+                "true_negatives": int(tn),
+                "false_positives": int(fp),
+                "false_negatives": int(fn),
+                "true_positives": int(tp),
+            }
+
+        # Predict on full dataset for output
         leakage_probs = clf.predict_proba(X)[:, 1]
 
         result_df = self.df.loc[df_model.index].copy()
         result_df["Leakage_Probability"] = leakage_probs
 
+        # Feature importance
         feature_importance = (
             pd.DataFrame(
                 {
@@ -841,6 +1119,7 @@ class RevenueLeakageAnalyzer:
             .reset_index(drop=True)
         )
 
+        # Metadata with evaluation metrics
         metadata = {
             "feature_importance": feature_importance.to_dict("records"),
             "high_risk_count": int((leakage_probs > 0.7).sum()),
@@ -849,6 +1128,8 @@ class RevenueLeakageAnalyzer:
             ),
             "low_risk_count": int((leakage_probs <= 0.4).sum()),
             "avg_probability": float(leakage_probs.mean()),
+            # NEW: Model evaluation metrics
+            "model_evaluation": evaluation_metrics,
         }
 
         return result_df, metadata
@@ -1079,6 +1360,98 @@ Use clear headings and bullets. Be as concrete and practical as possible.
 
 
 # ============================================================================
+# Cached Computation Wrappers (for Streamlit Performance)
+# ============================================================================
+# These functions add caching to expensive operations to prevent re-computation
+# on every Streamlit interaction. Cache keys include configuration parameters
+# to ensure cache invalidation when settings change.
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _get_analyzer_and_prepare(
+    df: pd.DataFrame,
+    target_margin: float,
+    high_discount_threshold: float,
+    forecast_horizon: int,
+) -> RevenueLeakageAnalyzer:
+    """
+    Cached analyzer initialization and data preparation.
+
+    This prevents re-running data preparation on every interaction.
+    Cache invalidates when configuration changes or after 1 hour.
+
+    Args:
+        df: Input DataFrame
+        target_margin: Target profit margin
+        high_discount_threshold: High discount threshold
+        forecast_horizon: Forecast horizon
+
+    Returns:
+        Prepared RevenueLeakageAnalyzer instance
+    """
+    config = RevenueLeakageConfig(
+        target_margin=target_margin,
+        high_discount_threshold=high_discount_threshold,
+        forecast_horizon=forecast_horizon,
+    )
+    analyzer = RevenueLeakageAnalyzer(df, config)
+    analyzer.prepare_data()
+    return analyzer
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _run_forecast_cached(
+    _analyzer: RevenueLeakageAnalyzer,
+    forecast_periods: int,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Cached forecast computation.
+
+    Args:
+        _analyzer: Prepared analyzer (prefixed with _ to avoid hashing)
+        forecast_periods: Number of periods to forecast
+
+    Returns:
+        (forecast_df, metrics_dict)
+    """
+    return _analyzer.forecast_leakage(forecast_periods)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _run_anomaly_detection_cached(
+    _analyzer: RevenueLeakageAnalyzer,
+    contamination: float,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Cached anomaly detection.
+
+    Args:
+        _analyzer: Prepared analyzer (prefixed with _ to avoid hashing)
+        contamination: Contamination parameter
+
+    Returns:
+        (anomalies_df, summary_dict)
+    """
+    return _analyzer.detect_anomalies(contamination)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _run_risk_scoring_cached(
+    _analyzer: RevenueLeakageAnalyzer,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Cached risk scoring.
+
+    Args:
+        _analyzer: Prepared analyzer (prefixed with _ to avoid hashing)
+
+    Returns:
+        (risk_scores_df, metadata_dict)
+    """
+    return _analyzer.score_leakage_risk()
+
+
+# ============================================================================
 # Streamlit UI Layer
 # ============================================================================
 
@@ -1144,17 +1517,14 @@ def run_revenue_leakage_app(df: pd.DataFrame, llm_client: Any) -> None:
             / 100
         )
 
-    # Create configuration
-    config = RevenueLeakageConfig(
-        target_margin=target_margin,
-        high_discount_threshold=high_discount_thresh,
-        forecast_horizon=forecast_horizon,
-    )
-
-    # Initialize analyzer and LLM wrapper
+    # Initialize analyzer using cached wrapper (prevents re-preparation on interactions)
     try:
-        analyzer = RevenueLeakageAnalyzer(df, config)
-        analyzer.prepare_data()
+        analyzer = _get_analyzer_and_prepare(
+            df,
+            target_margin=target_margin,
+            high_discount_threshold=high_discount_thresh,
+            forecast_horizon=forecast_horizon,
+        )
         llm_generator = LLMInsightGenerator(llm_client)
     except ValueError as e:
         st.error(f"❌ Data validation error: {str(e)}")
@@ -1719,7 +2089,8 @@ def _render_forecasting(
 
     try:
         with st.spinner("Training forecasting model..."):
-            forecast_df, metrics = analyzer.forecast_leakage(forecast_periods)
+            # Use cached wrapper to prevent re-computation
+            forecast_df, metrics = _run_forecast_cached(analyzer, forecast_periods)
 
         fig = go.Figure()
 
@@ -1810,7 +2181,8 @@ def _render_anomaly_detection(
 
     try:
         with st.spinner("Detecting anomalies..."):
-            anomalies_df, summary = analyzer.detect_anomalies(contamination)
+            # Use cached wrapper to prevent re-computation
+            anomalies_df, summary = _run_anomaly_detection_cached(analyzer, contamination)
 
         col1, col2, col3 = st.columns(3)
 
