@@ -2,7 +2,7 @@ import streamlit as st
 def display_title():
     st.markdown("""
     <div style='background-color:#00bfff; padding:10px; border-radius:10px; text-align:center;'>
-        <h1 style='color:white;'>AI-Powered Strategic Navigator for Business</h1>
+        <h1 style='color:white;'>IFB Decision Intelligence Hub</h1>
     </div>
     """, unsafe_allow_html=True)
 
@@ -27,11 +27,9 @@ def display_navigation():
         "📊 Data Insights",
         "💡 AI-Powered Strategies",
         "📈 Metric Tracking",
-        "💼 Company Analysis",
         "📊 Auto-Adaptive Business Strategy Maps",
         "💸 Revenue Leakage Analysis",
         "🔧 IFB Service Forecasting",
-        "💬 Feedback"
     ]
 
     selected_page = None
@@ -48,6 +46,6 @@ def display_footer():
     st.markdown("""
     <hr>
     <div style='text-align:center;'>
-        <p style='color:gray;'>© 2024 AI-Powered Strategic Navigator for Business. All rights reserved.</p>
+        <p style='color:gray;'>© 2025 IFB Decision Intelligence Hub. All rights reserved.</p>
     </div>
     """, unsafe_allow_html=True)
