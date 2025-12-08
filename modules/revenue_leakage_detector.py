@@ -7,10 +7,12 @@ product performance, and regional trends.
 
 Architecture:
     - RevenueLeakageAnalyzer: Core analytics and ML logic
-    - LLMInsightGenerator: LLM-based narrative insights
+    - LLMInsightGenerator: LLM-based narrative insights (now with enhanced reasoning)
     - Streamlit UI functions: User interface layer
 
 Author: IFB Decision Intelligence Hub
+
+Enhancement: LLM insights now use advanced reasoning scaffolds and guardrails.
 """
 
 from dataclasses import dataclass, field
@@ -30,6 +32,23 @@ from sklearn.ensemble import (
     IsolationForest,
 )
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# Enhanced LLM reasoning integration
+# Set to True to use enhanced ChatGPT-level insights (recommended)
+# Set to False to use original simple prompts (for comparison/fallback)
+USE_ENHANCED_LLM_INSIGHTS = True
+
+# Import enhanced insight generator if enabled
+if USE_ENHANCED_LLM_INSIGHTS:
+    try:
+        from modules.llm_reasoning import EnhancedInsightGenerator
+        _EnhancedInsightGeneratorAvailable = True
+    except ImportError as e:
+        print(f"⚠️ Enhanced insights not available: {e}")
+        print("Falling back to original insight generation.")
+        _EnhancedInsightGeneratorAvailable = False
+else:
+    _EnhancedInsightGeneratorAvailable = False
 
 
 # ============================================================================
@@ -2415,7 +2434,13 @@ def run_revenue_leakage_app(df: pd.DataFrame, llm_client: Any) -> None:
             high_discount_threshold=high_discount_thresh,
             forecast_horizon=forecast_horizon,
         )
-        llm_generator = LLMInsightGenerator(llm_client)
+
+        # Initialize LLM insight generator (use enhanced if available)
+        if USE_ENHANCED_LLM_INSIGHTS and _EnhancedInsightGeneratorAvailable:
+            llm_generator = EnhancedInsightGenerator(llm_client)
+            st.info("✨ Using enhanced LLM insights with advanced reasoning scaffolds")
+        else:
+            llm_generator = LLMInsightGenerator(llm_client)
     except ValueError as e:
         st.error(f"❌ Data validation error: {str(e)}")
         return
