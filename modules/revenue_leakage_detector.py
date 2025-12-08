@@ -943,6 +943,11 @@ class RevenueLeakageAnalyzer:
             lambda row: self._generate_anomaly_flags(row), axis=1
         )
 
+        # Persist anomaly flags and scores back to the main dataframe
+        # so other tabs (e.g., Recommendations) can see them.
+        self.df.loc[df_features.index, "Is_Anomaly"] = df_features["Is_Anomaly"].astype(bool)
+        self.df.loc[df_features.index, "Anomaly_Score"] = df_features["Anomaly_Score"]
+
         summary = {
             "total_transactions": len(self.df),
             "anomaly_count": len(anomalies_full),
@@ -1106,6 +1111,9 @@ class RevenueLeakageAnalyzer:
 
         result_df = self.df.loc[df_model.index].copy()
         result_df["Leakage_Probability"] = leakage_probs
+
+        # Persist leakage probabilities back to the main dataframe
+        self.df.loc[df_model.index, "Leakage_Probability"] = leakage_probs
 
         # Feature importance
         feature_importance = (
@@ -2445,7 +2453,7 @@ def run_revenue_leakage_app(df: pd.DataFrame, llm_client: Any) -> None:
         _render_forecasting(analyzer, llm_generator, forecast_horizon)
 
     with tabs[6]:
-        _render_anomaly_detection(analyzer, anomaly_sensitivity)
+        _render_anomaly_detection(analyzer, anomaly_sensitivity, llm_generator)
 
     with tabs[7]:
         _render_recommendations(analyzer, llm_generator)
@@ -3002,10 +3010,19 @@ def _render_forecasting(
         st.warning("⚠️ No date column found for time series forecasting.")
         return
 
+    run_forecast = st.button("▶️ Run Forecast Model")
+    if not run_forecast:
+        st.info("Click **Run Forecast Model** to train and view the leakage forecast.")
+        return
+
     try:
         with st.spinner("Training forecasting model..."):
             # Use cached wrapper to prevent re-computation
             forecast_df, metrics = _run_forecast_cached(analyzer, forecast_periods)
+
+            # Mark that forecast has been run and store metrics for other tabs
+            st.session_state["forecast_has_run"] = True
+            st.session_state["forecast_metrics"] = metrics
 
         fig = go.Figure()
 
@@ -3113,14 +3130,24 @@ def _render_forecasting(
 def _render_anomaly_detection(
     analyzer: RevenueLeakageAnalyzer,
     contamination: float,
+    llm_gen: LLMInsightGenerator,
 ) -> None:
     """Render anomaly detection tab."""
     st.subheader("📈 Anomaly Detection for Revenue Leakage")
+
+    run_anomaly = st.button("▶️ Run Anomaly Detection")
+    if not run_anomaly:
+        st.info("Click **Run Anomaly Detection** to identify anomalous transactions.")
+        return
 
     try:
         with st.spinner("Detecting anomalies..."):
             # Use cached wrapper to prevent re-computation
             anomalies_df, summary = _run_anomaly_detection_cached(analyzer, contamination)
+
+            # Mark that anomaly detection has been run and store summary
+            st.session_state["anomaly_has_run"] = True
+            st.session_state["anomaly_summary"] = summary
 
         col1, col2, col3 = st.columns(3)
 
@@ -3284,29 +3311,40 @@ def _render_recommendations(
     """)
 
     with st.expander("🔗 Cross-Signal Intelligence - Click to Expand", expanded=False):
-        # Check if we have anomaly and risk data
-        has_anomalies = 'Is_Anomaly' in analyzer.df.columns
-        has_risk = 'Leakage_Probability' in analyzer.df.columns
+        # Check if we have run the relevant analyses
+        has_forecast = st.session_state.get("forecast_has_run", False)
+        has_anomalies = st.session_state.get("anomaly_has_run", False)
+        has_risk = 'Leakage_Probability' in analyzer.df.columns  # risk tab not implemented yet
 
-        if has_anomalies or has_risk:
+        if has_forecast or has_anomalies or has_risk:
             with st.spinner("Synthesizing cross-model insights..."):
                 # Create AI Decision Intelligence orchestrator
                 ai_decision = AIDecisionIntelligence(analyzer, llm_gen)
 
-                # Get summaries
-                forecast_summary = {
-                    'historical_avg': metrics['total_leakage'] / 12,  # Rough estimate
-                    'avg_monthly_forecast': metrics['total_leakage'] / 12 * 1.1,  # Estimate trend
-                    'total_forecasted_leakage': metrics['total_leakage'] * 0.5,  # 6-month estimate
-                    'mae': metrics['total_leakage'] * 0.05,  # Estimate
-                }
+                # Prefer real forecast metrics if available
+                forecast_summary = st.session_state.get("forecast_metrics")
+                if not forecast_summary:
+                    # Fallback rough estimates if user didn't run forecasting
+                    forecast_summary = {
+                        'historical_avg': metrics['total_leakage'] / 12,
+                        'avg_monthly_forecast': metrics['total_leakage'] / 12 * 1.1,
+                        'total_forecasted_leakage': metrics['total_leakage'] * 0.5,
+                        'mae': metrics['total_leakage'] * 0.05,
+                        'rmse': metrics['total_leakage'] * 0.07,
+                    }
 
-                anomaly_summary = ai_decision._get_anomaly_summary() if has_anomalies else {
-                    'anomaly_count': 0,
-                    'anomaly_rate': 0,
-                    'high_risk_count': 0,
-                    'medium_risk_count': 0,
-                }
+                # Anomaly summary: prefer stored; fall back to analyzer helper
+                anomaly_summary = st.session_state.get("anomaly_summary")
+                if not anomaly_summary and has_anomalies:
+                    anomaly_summary = ai_decision._get_anomaly_summary()
+                if not anomaly_summary:
+                    anomaly_summary = {
+                        'anomaly_count': 0,
+                        'anomaly_rate': 0,
+                        'high_risk_count': 0,
+                        'medium_risk_count': 0,
+                        'low_risk_count': 0,
+                    }
 
                 risk_summary = ai_decision._get_risk_summary() if has_risk else {
                     'high_risk_count': 0,
@@ -3325,7 +3363,10 @@ def _render_recommendations(
                 )
                 st.markdown(cross_signal_insights)
         else:
-            st.info("📊 Cross-signal insights will be available after running Forecasting and Anomaly Detection tabs.")
+            st.info(
+                "📊 Cross-signal insights will be available after you run "
+                "**Forecasting** and **Anomaly Detection** from their respective tabs."
+            )
 
     st.markdown("---")
     st.markdown("#### 📥 Export Analysis Report")
