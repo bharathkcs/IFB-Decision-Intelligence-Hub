@@ -30,6 +30,7 @@ def display_navigation():
         "📊 Auto-Adaptive Business Strategy Maps",
         "💸 Revenue Leakage Analysis",
         "🔧 IFB Service Forecasting",
+        "⚙️ Spare Parts Planning",
     ]
 
     selected_page = None
