@@ -14,6 +14,7 @@ from modules.financial_data_handler import FinancialDataHandler
 from modules.strategy_map import StrategyMap
 from modules.revenue_leakage_detector import RevenueLeakageDetector
 from modules.ifb_service_forecasting import IFBServiceForecasting
+from modules.spare_parts_planning_page import render_spare_parts_planning_page
 
 
 llm = LLMInterface()
@@ -262,6 +263,10 @@ def main():
             - Complete service lifecycle data
             """)
 
+    elif page_to_display == "⚙️ Spare Parts Planning":
+        # NEW TAB: Spare Parts Demand Forecasting & Revenue Leakage
+        # This is a standalone add-on module - does NOT modify existing functionality
+        render_spare_parts_planning_page()
 
     elif page_to_display == "🔍 Q&A System":
         st.header("Interactive Q&A System")
